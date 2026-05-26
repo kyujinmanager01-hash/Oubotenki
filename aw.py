@@ -27,6 +27,7 @@ FIX LOG:
              thay vì dùng list đã lấy từ đầu trang
            - Reload trang nếu phát hiện row bị mất
   [FIX-8] apply_date: thử nhiều selector + parse thêm các định dạng
+  [FIX-9] apply_date: hỗ trợ format mới span.styles_dateTime__MPfnz (2026/5/26 13:34)
 """
 
 import asyncio
@@ -66,9 +67,9 @@ ROW_SEL   = 'tr[data-la="entries_detail_transition_click"]'
 MODAL_SEL = 'div.styles_container__BMWEr[role="dialog"]'
 
 # ── Retry config ──────────────────────────────────────────────────────────────
-MAX_MODAL_RETRIES   = 3    # số lần thử lại khi modal không lấy được tên
-MODAL_WAIT_MS       = 1200 # ms chờ sau khi click row (tăng từ 800)
-MODAL_EXTRA_WAIT_MS = 800  # ms chờ thêm nếu retry
+MAX_MODAL_RETRIES   = 3   # số lần thử lại khi modal không lấy được tên
+MODAL_WAIT_MS       = 150 # ms chờ tối thiểu sau click (modal wait thực tế ở scrape_modal)
+MODAL_EXTRA_WAIT_MS = 400 # ms chờ thêm nếu retry
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 LOG_DIR.mkdir(exist_ok=True)
@@ -89,7 +90,7 @@ log = logging.getLogger(__name__)
 
 def parse_birthday(text: str) -> str:
     m = re.search(r"(\d+)年(\d+)月(\d+)日生まれ", text)
-    return f"{m.group(1)}/{m.group(2)}/{m.group(3)}" if m else ""
+    return f"{m.group(1)}/{int(m.group(2)):02d}/{int(m.group(3)):02d}" if m else ""
 
 def parse_age(text: str) -> str:
     m = re.search(r"(\d+)歳", text)
@@ -233,6 +234,47 @@ def append_one_row(service, sheet_id: str, tab: str, applicant: dict):
     log.info(f"    📝 Ghi vào dòng {next_row}: {applicant.get('name', '')}")
 
 
+def _to_row(applicant: dict) -> list:
+    return [
+        applicant.get("apply_date", ""),   # A
+        applicant.get("name", ""),          # B
+        applicant.get("kana", ""),          # C
+        applicant.get("gender", ""),        # D
+        applicant.get("birthday", ""),      # E
+        applicant.get("age", ""),           # F
+        applicant.get("email", ""),         # G
+        applicant.get("tel", ""),           # H
+        applicant.get("address", ""),       # I
+        applicant.get("job_name", ""),      # J
+        applicant.get("employment", ""),    # K
+        applicant.get("work_location", ""), # L
+        applicant.get("status", ""),        # M
+        applicant.get("apply_id", ""),      # N ← hidden dedup key
+    ]
+
+
+def append_batch(service, sheet_id: str, tab: str, applicants: list[dict]) -> int:
+    """
+    Ghi toàn bộ danh sách ứng viên trong 1 lần gọi API duy nhất.
+    Trả về số dòng đã ghi thành công.
+    """
+    if not applicants:
+        return 0
+
+    next_row = get_next_empty_row(service, sheet_id, tab)
+    values   = [_to_row(a) for a in applicants]
+
+    service.spreadsheets().values().update(
+        spreadsheetId=sheet_id,
+        range=f"{tab}!A{next_row}",
+        valueInputOption="USER_ENTERED",
+        body={"values": values},
+    ).execute()
+
+    log.info(f"    📝 Ghi batch {len(values)} dòng từ dòng {next_row}")
+    return len(values)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Login
 # ══════════════════════════════════════════════════════════════════════════════
@@ -298,26 +340,84 @@ async def login_airwork(page, url: str, username: str, password: str) -> bool:
 async def goto_entries_page(page, page_num: int):
     url = ENTRIES_URL if page_num == 1 else f"{ENTRIES_URL}?page={page_num}"
     try:
-        await page.goto(url, wait_until="networkidle", timeout=30_000)
-    except PlaywrightTimeout:
         await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-    await page.wait_for_timeout(1500)
+    except PlaywrightTimeout:
+        await page.goto(url, wait_until="commit", timeout=30_000)
+    # Chờ row thực sự xuất hiện thay vì fixed timeout
     try:
-        await page.wait_for_selector(ROW_SEL, timeout=10_000)
+        await page.wait_for_selector(ROW_SEL, timeout=12_000)
     except PlaywrightTimeout:
         log.warning(f"  ⚠️  Không thấy row ứng viên ở trang {page_num}")
 
 
-async def get_row_ids(page) -> list[str]:
-    """Lấy danh sách apply_id từ tất cả row trong trang."""
+async def get_row_data(page) -> list[dict]:
+    """Lấy apply_id + apply_date từ danh sách — TRƯỚC khi click vào modal.
+    apply_date lấy từ span.styles_dateTime__MPfnz (thời gian thật, không bị
+    lệch múi giờ như thời gian trong modal header).
+
+    Tìm theo thứ tự:
+    1. span.styles_dateTime__MPfnz trong row (tr)
+    2. span.styles_dateTime__MPfnz trong parent element của row
+    3. Regex trực tiếp trên inner_text của row (fallback chắc nhất)
+    """
     rows = await page.query_selector_all(ROW_SEL)
     result = []
     for row in rows:
         apply_id = await row.get_attribute("data-la-apply")
-        if apply_id:
-            result.append(apply_id.strip())
+        if not apply_id:
+            continue
+        apply_id = apply_id.strip()
+
+        apply_date = ""
+
+        def _parse_dt(raw: str) -> str:
+            m = re.search(r"(\d{4})/(\d{1,2})/(\d{1,2})\s+(\d{1,2}:\d{2})", raw)
+            if m:
+                return f"{m.group(1)}/{int(m.group(2)):02d}/{int(m.group(3)):02d} {m.group(4)}"
+            return ""
+
+        try:
+            # 1. Tìm trong row trực tiếp
+            dt_el = await row.query_selector("span.styles_dateTime__MPfnz")
+            if dt_el:
+                apply_date = _parse_dt((await dt_el.inner_text()).strip())
+
+            # 2. Nếu không thấy, tìm trong parent (row có thể là <tr> con của wrapper)
+            if not apply_date:
+                apply_date = await page.evaluate("""
+                    (rowEl) => {
+                        // Tìm lên parent tối đa 3 cấp
+                        let node = rowEl.parentElement;
+                        for (let i = 0; i < 3 && node; i++) {
+                            const span = node.querySelector('span.styles_dateTime__MPfnz');
+                            if (span) return span.innerText.trim();
+                            node = node.parentElement;
+                        }
+                        return '';
+                    }
+                """, row)
+                if apply_date:
+                    apply_date = _parse_dt(apply_date) or apply_date
+
+            # 3. Fallback: regex trên toàn bộ text của row
+            if not apply_date:
+                row_text = await row.inner_text()
+                apply_date = _parse_dt(row_text)
+
+        except Exception as e:
+            log.debug(f"    get_row_data date error for {apply_id}: {e}")
+
+        result.append({"apply_id": apply_id, "apply_date": apply_date})
+        log.debug(f"    row {apply_id}: apply_date={apply_date!r}")
+
     log.info(f"  📋 {len(result)} ứng viên trong trang")
     return result
+
+
+# keep backward compat — used in iter_new_applicants
+async def get_row_ids(page) -> list[str]:
+    data = await get_row_data(page)
+    return [d["apply_id"] for d in data]
 
 
 async def get_total_pages(page) -> int:
@@ -355,12 +455,19 @@ async def close_modal(page):
         if el:
             try:
                 await el.click(timeout=2_000)
-                await page.wait_for_timeout(500)
+                # Chờ modal thực sự biến mất thay vì fixed 500ms
+                try:
+                    await page.wait_for_selector(MODAL_SEL, state="hidden", timeout=3_000)
+                except PlaywrightTimeout:
+                    pass
                 return
             except Exception:
                 continue
     await page.keyboard.press("Escape")
-    await page.wait_for_timeout(500)
+    try:
+        await page.wait_for_selector(MODAL_SEL, state="hidden", timeout=3_000)
+    except PlaywrightTimeout:
+        await page.wait_for_timeout(200)
 
 
 async def _dump_modal_debug(page, apply_id: str, attempt: int):
@@ -380,6 +487,22 @@ async def _dump_modal_debug(page, apply_id: str, attempt: int):
         log.warning(f"    ⚠️  Không dump được debug: {e}")
 
 
+async def _get_icon_text(modal, data_type: str) -> str:
+    """
+    Lấy text từ span.styles_infoText__UN0fw nằm ngay sau
+    span[data-type="{data_type}"] — dùng cho call/mail/address/human.
+    """
+    try:
+        el = await modal.query_selector(
+            f'span[data-type="{data_type}"] + span.styles_infoText__UN0fw'
+        )
+        if el:
+            return (await el.inner_text()).strip()
+    except Exception:
+        pass
+    return ""
+
+
 async def scrape_modal(page, apply_id: str) -> dict:
     """
     [FIX-6] Đọc modal với wait ổn định hơn + nhiều selector dự phòng cho 氏名.
@@ -394,11 +517,20 @@ async def scrape_modal(page, apply_id: str) -> dict:
         log.warning("    ⚠️  Modal không xuất hiện (timeout)")
         return {}
 
-    # Thêm: chờ network idle sau khi modal mở để dữ liệu load xong
+    # Chờ h1 tên thực sự load xong bên trong modal
+    # (modal container xuất hiện nhanh nhưng nội dung load async)
     try:
-        await page.wait_for_load_state("networkidle", timeout=5_000)
+        await page.wait_for_selector(
+            f"{MODAL_SEL} h1.styles_title__Gs8Yk",
+            state="visible",
+            timeout=6_000,
+        )
     except PlaywrightTimeout:
-        pass  # Không bắt buộc, tiếp tục
+        # Fallback: chờ bất kỳ h1 nào trong modal
+        try:
+            await page.wait_for_selector(f"{MODAL_SEL} h1", state="visible", timeout=3_000)
+        except PlaywrightTimeout:
+            pass
 
     modal = await page.query_selector(MODAL_SEL)
     if not modal:
@@ -420,54 +552,47 @@ async def scrape_modal(page, apply_id: str) -> dict:
             pass
         return ""
 
-    async def mtext_all(sel: str) -> list[str]:
-        results = []
+    async def mtext_modal_only(sel: str) -> str:
+        """Chỉ query trong modal — không fallback ra page.
+        Dùng cho 応募日時 để tránh lấy nhầm phần tử ngoài modal."""
         try:
-            els = await modal.query_selector_all(sel)
-            for el in els:
-                t = (await el.inner_text()).strip()
-                if t:
-                    results.append(t)
+            el = await modal.query_selector(sel)
+            if el:
+                return (await el.inner_text()).strip()
         except Exception:
             pass
-        return results
+        return ""
 
     # ── 氏名 ──────────────────────────────────────────────────────────────
-    # [FIX-6] Thêm nhiều selector dự phòng + log selector nào thành công
     data["name"] = ""
     NAME_SELECTORS = [
-        "h1.styles_title__Gs8Yk",      # selector gốc (CSS class cụ thể)
+        "h1.styles_title__Gs8Yk",
         "h1[class*='title']",
         "h1[class*='name']",
         "h1[class*='applicant']",
         "[class*='applicantName']",
         "[class*='candidateName']",
         "[class*='userName']",
-        "h1",                           # fallback: bất kỳ h1 nào trong modal
+        "h1",
     ]
     for sel in NAME_SELECTORS:
         val = await mtext(sel)
-        # Tên người Nhật: 2–20 ký tự, không chứa URL hay ký tự đặc biệt
         if val and 2 <= len(val) <= 30 and "http" not in val and "\n" not in val:
             data["name"] = val
             log.debug(f"    氏名 via [{sel}]: {val}")
             break
 
-    # Nếu vẫn không có → thử tìm h1 đầu tiên trong toàn modal (rộng hơn)
     if not data["name"]:
         try:
-            all_h1 = await modal.query_selector_all("h1, h2")
-            for h1 in all_h1:
+            for h1 in await modal.query_selector_all("h1, h2"):
                 t = (await h1.inner_text()).strip()
                 if t and 2 <= len(t) <= 30 and "http" not in t:
                     data["name"] = t
-                    log.debug(f"    氏名 fallback h1/h2: {t}")
                     break
         except Exception:
             pass
 
     if not data["name"]:
-        # Không lấy được tên — trả {} để caller retry
         return {}
 
     # ── カナ ──────────────────────────────────────────────────────────────
@@ -480,163 +605,76 @@ async def scrape_modal(page, apply_id: str) -> dict:
             break
 
     # ── 応募日時 ──────────────────────────────────────────────────────────
-    # [FIX-8] Thêm nhiều selector + parse thêm định dạng ngày
+    # Lấy từ danh sách (span.styles_dateTime__MPfnz trong row) TRƯỚC khi click
+    # → thời gian đúng, không bị lệch múi giờ. Xem get_row_data() + caller.
+    # scrape_modal KHÔNG lấy apply_date nữa; caller sẽ ghi đè sau khi return.
     data["apply_date"] = ""
-    APPLY_DATE_SELECTORS = [
-        'div[data-type="応募日時"]',
-        '[class*="applyDate"]',
-        '[class*="apply_date"]',
-        '[class*="applyAt"]',
-        '[class*="appliedAt"]',
-        'dt:has-text("応募日時") + dd',
-        'th:has-text("応募日時") + td',
-        'label:has-text("応募日時") + span',
-        'td:has-text("応募日時") + td',
-        # AirWork đôi khi dùng span/p thay vì dd
-        'p[class*="date"]',
-        'span[class*="date"]',
-    ]
-    for sel in APPLY_DATE_SELECTORS:
-        val = await mtext(sel)
-        if val and ("年" in val or "月" in val or re.search(r"\d{4}/\d{2}", val)):
-            # "2026年5月13日(水) 15:45" → "2026/05/13 15:45"
-            m = re.search(r"(\d{4})年(\d{1,2})月(\d{1,2})日[^0-9]*(\d{1,2}:\d{2})", val)
-            if m:
-                data["apply_date"] = (
-                    f"{m.group(1)}/{int(m.group(2)):02d}/{int(m.group(3)):02d} {m.group(4)}"
-                )
-            else:
-                data["apply_date"] = val.strip()
-            log.debug(f"    応募日時 via [{sel}]: {data['apply_date']}")
-            break
 
     # ── 年齢・生年月日・性別 ───────────────────────────────────────────────
-    bio_text = ""
-    try:
-        candidates = await modal.query_selector_all("span, p, dd, td, div, h3")
-        for el in candidates:
-            t = (await el.inner_text()).strip()
-            if "歳" in t and ("生まれ" in t or "男" in t or "女" in t) and len(t) < 80:
-                bio_text = t
-                break
-    except Exception:
-        pass
-
+    # <span data-type="human"></span>
+    # <span class="styles_infoText__UN0fw">43歳（1982年8月19日生まれ）／男性</span>
+    # E = 生年月日 YYYY/MM/DD,  F = 年齢 (数字のみ),  D = 性別
+    bio_text = await _get_icon_text(modal, "human")
     data["gender"]   = parse_gender(bio_text)
     data["birthday"] = parse_birthday(bio_text)
     data["age"]      = parse_age(bio_text)
 
     # ── Email ─────────────────────────────────────────────────────────────
-    data["email"] = ""
-    try:
-        candidates = await modal.query_selector_all("span, p, dd, td, a")
-        for el in candidates:
-            t = (await el.inner_text()).strip()
-            if "@" in t and "." in t and len(t) < 100 and " " not in t and "\n" not in t:
-                data["email"] = t
-                break
-    except Exception:
-        pass
+    # <span data-type="mail"></span>
+    # <span class="styles_infoText__UN0fw">xxx@gmail.com</span>
+    data["email"] = await _get_icon_text(modal, "mail")
 
     # ── 電話番号 ──────────────────────────────────────────────────────────
-    data["tel"] = ""
-    try:
-        candidates = await modal.query_selector_all("span, p, dd, td")
-        for el in candidates:
-            t = (await el.inner_text()).strip()
-            clean = re.sub(r"[-\s　]", "", t)
-            if re.match(r"^0\d{9,10}$", clean):
-                data["tel"] = t
-                break
-    except Exception:
-        pass
+    # <span data-type="call"></span>
+    # <span class="styles_infoText__UN0fw">08056915963</span>
+    data["tel"] = await _get_icon_text(modal, "call")
 
     # ── 住所 ─────────────────────────────────────────────────────────────
-    data["address"] = ""
-    for sel in [
-        '[class*="address"]',
-        'dt:has-text("住所") + dd',
-        'th:has-text("住所") + td',
-        'label:has-text("住所") + span',
-    ]:
-        val = await mtext(sel)
-        if val and len(val) < 120:
-            data["address"] = val
-            break
-
-    if not data["address"]:
-        PREF_KEYWORDS = ["県", "都", "道", "府"]
-        JOB_KEYWORDS  = ["求人", "スポーツ", "ジム", "フィットネス", "店舗", "マネジメント",
-                         "スタッフ", "受付", "接客", "正社員", "アルバイト", "パート"]
-        try:
-            candidates = await modal.query_selector_all("span, p, dd, td, li")
-            for el in candidates:
-                t = (await el.inner_text()).strip()
-                has_pref     = any(k in t for k in PREF_KEYWORDS)
-                has_job_kw   = any(k in t for k in JOB_KEYWORDS)
-                has_postcode = re.search(r"〒?\d{3}[-－]\d{4}", t)
-                is_short     = 5 < len(t) < 120
-                if has_pref and not has_job_kw and is_short:
-                    data["address"] = t
-                    break
-                if has_postcode and is_short:
-                    data["address"] = t
-                    break
-        except Exception:
-            pass
+    # <span data-type="address"></span>
+    # <span class="styles_infoText__UN0fw">宮城県 東松島市...</span>
+    # ⚠️ Chỉ lấy từ icon address — không fallback heuristic để tránh ghi nhầm số điện thoại
+    data["address"] = await _get_icon_text(modal, "address")
 
     # ── 応募求人名 ────────────────────────────────────────────────────────
+    # <a class="styles_jobTitleLink__YzGop ...">フィットネスジムの受付・ご案内スタッフ</a>
     data["job_name"] = ""
-    try:
-        p_el = await modal.query_selector("p:has(a.styles_linkDetail__qbl4P)")
-        if not p_el:
-            p_el = await modal.query_selector("p:has(a[class*='linkDetail'])")
-        if p_el:
-            full_text = (await p_el.inner_text()).strip()
-            a_els = await p_el.query_selector_all("a")
-            for a_el in a_els:
-                a_text = (await a_el.inner_text()).strip()
-                if a_text:
-                    full_text = full_text.replace(a_text, "").strip()
-            if full_text:
-                data["job_name"] = full_text
-    except Exception:
-        pass
-
-    if not data["job_name"]:
-        for sel in [
-            "[class*='jobTitle']",
-            'dt:has-text("応募求人") + dd',
-            'td:has-text("応募求人") + td',
-            'dt:has-text("求人") + dd',
-        ]:
-            val = await mtext(sel)
-            if val:
-                data["job_name"] = val.replace("求人内容を確認する", "").strip()
-                break
-
-    # ── 雇用形態 ──────────────────────────────────────────────────────────
-    data["employment"] = ""
     for sel in [
-        'div[data-type="応募先（雇用形態）"]',
-        'dt:has-text("雇用形態") + dd',
-        'td:has-text("雇用形態") + td',
+        'a.styles_jobTitleLink__YzGop',
+        'a[data-la="entry_detail_job_offer_preview_link_click"]',
+        '[class*="jobTitle"]',
+        'dt:has-text("応募求人") + dd',
     ]:
         val = await mtext(sel)
         if val:
-            data["employment"] = val
+            # Strip prefix kiểu [11263686] mà AirWork đôi khi thêm vào
+            val = re.sub(r"^\[\d+\]\s*", "", val).strip()
+            data["job_name"] = val
             break
 
-    # ── 応募先（勤務地） ──────────────────────────────────────────────────
-    data["work_location"] = ""
+    # ── 雇用形態 (col K) ──────────────────────────────────────────────────
+    # <span class="styles_jobLabel__6SC9n">アルバイト・パート</span>
+    data["employment"] = ""
     for sel in [
-        'div[data-type="応募先（勤務地）"]',
-        'dt:has-text("勤務地") + dd',
-        'td:has-text("勤務地") + td',
+        'span.styles_jobLabel__6SC9n',
+        '[class*="jobLabel"]',
+        'dt:has-text("雇用形態") + dd',
     ]:
         val = await mtext(sel)
         if val:
-            data["work_location"] = val
+            data["employment"] = val.strip()
+            break
+
+    # ── 応募先 (col L) ────────────────────────────────────────────────────
+    # <span class="styles_jobCaption__hJsiu">アッティーボジム高見プラザ店</span>
+    data["work_location"] = ""
+    for sel in [
+        'span.styles_jobCaption__hJsiu',
+        '[class*="jobCaption"]',
+        'dt:has-text("勤務地") + dd',
+    ]:
+        val = await mtext(sel)
+        if val:
+            data["work_location"] = val.strip()
             break
 
     # ── 対応ステータス ────────────────────────────────────────────────────
@@ -647,7 +685,7 @@ async def scrape_modal(page, apply_id: str) -> dict:
         )
         if status_el:
             selected_val = await status_el.evaluate("el => el.value")
-            option_el    = await page.query_selector(f'select option[value="{selected_val}"]')
+            option_el    = await status_el.query_selector(f'option[value="{selected_val}"]')
             if option_el:
                 data["status"] = (await option_el.inner_text()).strip()
     except Exception:
@@ -662,27 +700,30 @@ async def scrape_modal(page, apply_id: str) -> dict:
 
 async def click_and_scrape(page, apply_id: str, index: int) -> dict | None:
     """
-    [FIX-6] Retry tối đa MAX_MODAL_RETRIES lần.
-    Mỗi lần thất bại: đóng modal (nếu có), chờ thêm, click lại.
-    Trả None nếu hết retry.
+    Retry tối đa MAX_MODAL_RETRIES lần.
+    - Chỉ chờ tối thiểu sau click (scrape_modal tự chờ modal visible)
+    - Tăng dần thời gian chờ khi retry
     """
     for attempt in range(1, MAX_MODAL_RETRIES + 1):
         try:
-            # [FIX-7] Re-query row mỗi lần thử để tránh stale element
+            # Re-query row mỗi lần thử để tránh stale element
             row = await page.query_selector(f'{ROW_SEL}[data-la-apply="{apply_id}"]')
             if not row:
                 log.warning(f"    [{index}] Attempt {attempt}: row không còn trong DOM — reload trang")
-                # Row biến mất → reload trang, thử lại
-                await page.reload(wait_until="networkidle", timeout=20_000)
-                await page.wait_for_timeout(1500)
+                await page.reload(wait_until="domcontentloaded", timeout=20_000)
+                try:
+                    await page.wait_for_selector(ROW_SEL, timeout=8_000)
+                except PlaywrightTimeout:
+                    pass
                 row = await page.query_selector(f'{ROW_SEL}[data-la-apply="{apply_id}"]')
                 if not row:
                     log.warning(f"    [{index}] Row vẫn không có sau reload — bỏ qua")
                     return None
 
             await row.click()
-            wait_ms = MODAL_WAIT_MS + (attempt - 1) * MODAL_EXTRA_WAIT_MS
-            await page.wait_for_timeout(wait_ms)
+            # Chờ tối thiểu để click register, scrape_modal sẽ wait_for_selector modal
+            pre_wait = MODAL_WAIT_MS + (attempt - 1) * MODAL_EXTRA_WAIT_MS
+            await page.wait_for_timeout(pre_wait)
 
             detail = await scrape_modal(page, apply_id)
 
@@ -691,11 +732,10 @@ async def click_and_scrape(page, apply_id: str, index: int) -> dict | None:
                     log.info(f"    [{index}] ✅ Lấy được sau {attempt} lần thử: {detail['name']}")
                 return detail
 
-            # Tên rỗng → dump debug rồi retry
             log.warning(f"    [{index}] Attempt {attempt}/{MAX_MODAL_RETRIES}: tên rỗng — ID={apply_id}")
             await _dump_modal_debug(page, apply_id, attempt)
             await close_modal(page)
-            await page.wait_for_timeout(600)
+            await page.wait_for_timeout(300)
 
         except Exception as e:
             log.warning(f"    [{index}] Attempt {attempt}/{MAX_MODAL_RETRIES}: exception — {e}")
@@ -703,7 +743,7 @@ async def click_and_scrape(page, apply_id: str, index: int) -> dict | None:
                 await close_modal(page)
             except Exception:
                 pass
-            await page.wait_for_timeout(600)
+            await page.wait_for_timeout(300)
 
     log.error(f"    [{index}] ❌ Hết retry, bỏ qua ID={apply_id} — xem debug dump trong logs/")
     return None
@@ -722,16 +762,18 @@ async def iter_new_applicants(page, page_num: int, existing_ids: set, full_scan:
         await page.screenshot(path=str(LOG_DIR / "debug_entries.png"))
         log.info(f"  📸 debug_entries.png — URL: {page.url}")
 
-    # Lấy danh sách apply_id một lần — chỉ dùng để lặp, không dùng element
-    apply_ids = await get_row_ids(page)
+    # Lấy danh sách apply_id + apply_date từ danh sách (trước khi click modal)
+    row_data = await get_row_data(page)
 
-    if not apply_ids:
+    if not row_data:
         log.warning(f"  ⚠️  Không thấy row ứng viên ở trang {page_num}")
         html = await page.content()
         (LOG_DIR / f"debug_empty_p{page_num}.html").write_text(html, encoding="utf-8")
         return
 
-    for i, apply_id in enumerate(apply_ids):
+    for i, rd in enumerate(row_data):
+        apply_id   = rd["apply_id"]
+        apply_date = rd["apply_date"]
         if apply_id in existing_ids:
             log.info(f"    [{i+1}] ID={apply_id} đã có — bỏ qua")
             continue
@@ -741,6 +783,10 @@ async def iter_new_applicants(page, page_num: int, existing_ids: set, full_scan:
         if detail is None:
             # Hết retry, bỏ qua nhưng KHÔNG break — tiếp tục ứng viên sau
             continue
+
+        # Ghi đè apply_date bằng thời gian từ danh sách (tránh lệch +2h từ modal)
+        if apply_date:
+            detail["apply_date"] = apply_date
 
         log.info(f"    [{i+1}] ✓ {detail['name']}  {detail.get('apply_date', '')}")
         yield detail
@@ -784,39 +830,91 @@ async def process_account(browser, account: dict, sheets_service, full_scan: boo
         if not ok:
             return
 
-        page_num      = 1
-        total_written = 0
+        # ── Thu thập tất cả ứng viên mới ─────────────────────────────────
+        # AirWork hiển thị mới nhất trước.
+        # Dò từng trang cho đến khi gặp apply_id đã có trong sheet → dừng.
+        # Nếu full_scan → dò hết tất cả trang, bỏ qua ID đã có.
+        all_new: list[dict] = []
+        page_num   = 1
+        stop_scan  = False
 
-        while True:
+        while not stop_scan:
             log.info(f"  📄 Trang {page_num}...")
             await goto_entries_page(page, page_num)
 
-            row_ids_on_page = await get_row_ids(page)
-            total_on_page   = len(row_ids_on_page)
+            if page_num == 1:
+                await page.screenshot(path=str(LOG_DIR / "debug_entries.png"))
 
-            async for applicant in iter_new_applicants(page, page_num, existing_ids, full_scan):
-                try:
-                    append_one_row(sheets_service, sheet_id, tab_name, applicant)
-                    existing_ids.add(applicant["apply_id"])
-                    total_written += 1
-                    log.info(f"    ✅ Đã ghi: {applicant['name']}")
-                except Exception as e:
-                    log.error(f"    ❌ Ghi sheet thất bại: {e}")
+            row_data = await get_row_data(page)
 
-            if total_on_page == 0 and page_num > 1:
-                log.warning("  ⚠️  Trang trống thật — dừng")
+            if not row_data:
+                log.warning(f"  ⚠️  Không thấy row ứng viên ở trang {page_num} — dừng")
+                html = await page.content()
+                (LOG_DIR / f"debug_empty_p{page_num}.html").write_text(html, encoding="utf-8")
                 break
 
-            if not full_scan:
-                log.info("  — Chế độ thường: chỉ check trang 1")
+            for i, rd in enumerate(row_data):
+                apply_id   = rd["apply_id"]
+                apply_date = rd["apply_date"]
+                if apply_id in existing_ids:
+                    if full_scan:
+                        log.info(f"    [{i+1}] ID={apply_id} đã có — bỏ qua (full scan)")
+                        continue
+                    else:
+                        # Gặp ID cũ → đã đến vùng đã ghi → dừng hoàn toàn
+                        log.info(f"    [{i+1}] Gặp ID đã có ({apply_id}) — dừng quét")
+                        stop_scan = True
+                        break
+
+                detail = await click_and_scrape(page, apply_id, i + 1)
+                if detail is None:
+                    continue
+
+                # Ghi đè apply_date bằng thời gian lấy từ danh sách
+                # (thời gian trong modal header bị lệch múi giờ +2h)
+                if apply_date:
+                    detail["apply_date"] = apply_date
+
+                log.info(f"    [{i+1}] ✓ {detail['name']}  {detail.get('apply_date', '')}")
+                all_new.append(detail)
+
+                await close_modal(page)
+                # close_modal đã chờ modal hidden — không cần wait thêm
+
+            if stop_scan:
                 break
 
+            # Kiểm tra còn trang tiếp theo không
             total_pages = await get_total_pages(page)
             if page_num >= total_pages or total_pages == 1:
                 log.info(f"  ✅ Đã quét hết {page_num} trang")
                 break
 
             page_num += 1
+
+        # ── Sắp xếp: cũ nhất → mới nhất trước khi ghi ───────────────────
+        def _sort_key(a: dict):
+            ds = a.get("apply_date", "")
+            for fmt in ("%Y/%m/%d %H:%M", "%Y/%m/%d"):
+                try:
+                    return datetime.strptime(ds, fmt)
+                except ValueError:
+                    continue
+            return datetime.min
+
+        all_new.sort(key=_sort_key)
+        log.info(f"  🆕 {len(all_new)} ứng viên mới — ghi theo thứ tự cũ → mới")
+
+        # ── Ghi batch 1 lần duy nhất (thay vì N lần API call) ────────────
+        total_written = 0
+        if all_new:
+            try:
+                total_written = append_batch(sheets_service, sheet_id, tab_name, all_new)
+                for a in all_new:
+                    existing_ids.add(a["apply_id"])
+                    log.info(f"    ✅ {a['name']}  {a.get('apply_date', '')}")
+            except Exception as e:
+                log.error(f"    ❌ Ghi batch thất bại: {e}")
 
         log.info(f"  🆕 Tổng đã ghi: {total_written} ứng viên")
 
