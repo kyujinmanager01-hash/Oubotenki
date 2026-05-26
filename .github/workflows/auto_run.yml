@@ -1,33 +1,27 @@
 name: Tu dong chay scraper
-
 on:
   schedule:
     - cron: '*/30 * * * *'
   workflow_dispatch:
-
 jobs:
   chay-script:
     runs-on: ubuntu-latest
-
     steps:
       - name: Lay code tu repo
         uses: actions/checkout@v4
-
       - name: Cai dat Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
       - name: Cai dat thu vien
         run: pip install -r requirements.txt
-
+      - name: Cai dat Chromium
+        run: playwright install chromium
       - name: Tao lai file credentials.json
         run: |
           mkdir -p credentials
           echo '${{ secrets.GOOGLE_CREDENTIALS_JSON }}' > credentials/credentials.json
-
       - name: Chay aw.py
         run: python aw.py
-
       - name: Chay kbx.py
         run: python kbx.py
