@@ -8,9 +8,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Lay code tu repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.2.2
       - name: Cai dat Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v5.6.0
         with:
           python-version: '3.11'
       - name: Cai dat thu vien
