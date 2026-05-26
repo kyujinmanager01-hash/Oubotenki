@@ -98,9 +98,9 @@ def parse_birthday_kbx(text: str) -> str:
     return f"{m.group(1)}/{m.group(2)}/{m.group(3)}" if m else ""
 
 def parse_age_kbx(text: str) -> str:
-    """'2004年11月3日（21歳）' → '21歳'"""
-    m = re.search(r"（(\d+)歳）", text)
-    return f"{m.group(1)}歳" if m else ""
+    """'2004年11月3日（21歳）' or '(21歳)' → '21'"""
+    m = re.search(r'[\(（](\d+)歳[\)）]', text)
+    return m.group(1) if m else ""
 
 def parse_apply_date_kbx(text: str) -> str:
     """
@@ -187,12 +187,12 @@ def read_master_accounts_kbx(service) -> list[dict]:
 
 
 def get_existing_ids_kbx(service, sheet_id: str, tab: str) -> set:
-    """Đọc cột L (応募番号) làm dedup key."""
+    """Đọc cột N (応募番号) làm dedup key."""
     existing = set()
     try:
         result = service.spreadsheets().values().get(
             spreadsheetId=sheet_id,
-            range=f"{tab}!L3:L",
+            range=f"{tab}!N3:N",
         ).execute()
         for row in result.get("values", []):
             if row and row[0].strip():
@@ -223,26 +223,29 @@ def get_next_empty_row_kbx(service, sheet_id: str, tab: str) -> int:
 def append_one_row_kbx(service, sheet_id: str, tab: str, applicant: dict):
     """
     Ghi 1 ứng viên vào dòng trống cuối.
-    Layout A–L:
-      A: apply_date   B: name      C: (trống)   D: gender
-      E: birthday     F: age       G: email      H: tel
-      I: address      J: job_name  K: status     L: apply_number (dedup)
+    Layout A–N:
+      A: apply_date   B: name      C: kana(カナ)  D: gender
+      E: birthday     F: age       G: email        H: tel
+      I: address      J: school    K: job_name     L: current_job
+      M: status       N: apply_number (dedup)
     """
     next_row = get_next_empty_row_kbx(service, sheet_id, tab)
 
     row_data = [[
         applicant.get("apply_date", ""),    # A
         applicant.get("name", ""),          # B
-        "",                                 # C — reserved
+        applicant.get("kana", ""),          # C — カナ
         applicant.get("gender", ""),        # D
         applicant.get("birthday", ""),      # E
-        applicant.get("age", ""),           # F
+        applicant.get("age", ""),           # F — số tuổi, không có 歳
         applicant.get("email", ""),         # G
         applicant.get("tel", ""),           # H
         applicant.get("address", ""),       # I
-        applicant.get("job_name", ""),      # J
-        applicant.get("status", ""),        # K
-        applicant.get("apply_number", ""),  # L ← dedup key
+        applicant.get("school", ""),        # J ← 学校名
+        applicant.get("job_name", ""),      # K
+        applicant.get("current_job", ""),   # L ← 現在の職業
+        applicant.get("status", ""),        # M
+        applicant.get("apply_number", ""),  # N ← dedup key
     ]]
 
     service.spreadsheets().values().update(
@@ -253,6 +256,41 @@ def append_one_row_kbx(service, sheet_id: str, tab: str, applicant: dict):
     ).execute()
 
     log.info(f"    📝 Ghi dòng {next_row}: {applicant.get('name', '')}  [{applicant.get('apply_number', '')}]")
+
+
+def _to_row_kbx(applicant: dict) -> list:
+    return [
+        applicant.get("apply_date", ""),    # A
+        applicant.get("name", ""),          # B
+        applicant.get("kana", ""),          # C — カナ
+        applicant.get("gender", ""),        # D
+        applicant.get("birthday", ""),      # E
+        applicant.get("age", ""),           # F — số tuổi, không có 歳
+        applicant.get("email", ""),         # G
+        applicant.get("tel", ""),           # H
+        applicant.get("address", ""),       # I
+        applicant.get("school", ""),        # J ← 学校名
+        applicant.get("job_name", ""),      # K
+        applicant.get("current_job", ""),   # L ← 現在の職業
+        applicant.get("status", ""),        # M
+        applicant.get("apply_number", ""),  # N ← dedup key
+    ]
+
+
+def append_batch_kbx(service, sheet_id: str, tab: str, applicants: list[dict]) -> int:
+    """Ghi toàn bộ danh sách ứng viên (đã sort) trong 1 lần gọi API."""
+    if not applicants:
+        return 0
+    next_row = get_next_empty_row_kbx(service, sheet_id, tab)
+    values   = [_to_row_kbx(a) for a in applicants]
+    service.spreadsheets().values().update(
+        spreadsheetId=sheet_id,
+        range=f"{tab}!A{next_row}",
+        valueInputOption="USER_ENTERED",
+        body={"values": values},
+    ).execute()
+    log.info(f"    📝 Ghi batch {len(values)} dòng từ dòng {next_row}")
+    return len(values)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -682,68 +720,102 @@ async def scrape_drawer(page, apply_number: str) -> dict:
             data["apply_date"] = parse_apply_date_kbx(t)
             break
 
-    # ── 氏名 (cột B) ─────────────────────────────────────────────────────
+    # ── 氏名 + カナ (cột B, C) ────────────────────────────────────────────
     # HTML thực tế KBX (xác nhận từ DevTools):
-    #   <h3 class="c-title c-title--type4 ...">氏名</h3>
-    #   <p class="c-lines">今村寿良 寿良</p>
-    # → Tên nằm trong p.c-lines ngay SAU h3/h4 có text "氏名"
+    #   氏名:  <h3 class="c-title c-title--type4 ...">氏名</h3>
+    #          <p class="c-lines">吉川 忠浩</p>
+    #   カナ:  <h1 class="c-title c-title--type1 ...">吉川 忠浩
+    #              <span class="c-note u-m5--left">(よしかわ ただひろ)</span>
+    #          </h1>
+    # → Tên lấy từ p.c-lines sau label 氏名
+    # → カナ lấy từ span.c-note có parent H1, bỏ dấu ngoặc ()（）
     data["name"] = ""
+    data["kana"] = ""
 
-    # Cách 1: Tìm label "氏名" rồi lấy p.c-lines kế tiếp (chính xác nhất)
+    # ── Lấy カナ: query tất cả span.c-note, lọc cái có hiragana + parent H1 ──
+    # Console xác nhận: class="c-note u-m5--left", parent H1.c-title--type1
     try:
-        name_labels = await page.query_selector_all(
-            'h3.c-title, h4.c-title, [class*="c-title"]'
-        )
-        for label_el in name_labels:
-            label_text = (await label_el.inner_text()).strip()
-            if label_text == "氏名":
-                # Lấy sibling p.c-lines tiếp theo
-                sibling = await label_el.evaluate_handle(
-                    """el => {
-                        let next = el.nextElementSibling;
-                        while (next) {
-                            if (next.matches('p.c-lines')) return next;
-                            next = next.nextElementSibling;
-                        }
-                        // Thử trong li cha
-                        const li = el.closest('li');
-                        if (li) {
-                            const p = li.querySelector('p.c-lines');
-                            if (p) return p;
-                        }
-                        return null;
-                    }"""
-                )
-                if sibling:
-                    t = (await sibling.inner_text()).strip()
-                    # Loại bỏ kana trong ngoặc: "今村寿良（いまむら）"
-                    t = re.sub(r'\s*[\(（][^\)）]{1,30}[\)）]', '', t).strip()
+        kana_spans = await page.query_selector_all("span.c-note")
+        for span_el in kana_spans:
+            txt = (await span_el.inner_text()).strip()
+            # Phải có hiragana/katakana và parent là H1
+            if not re.search(r'[ぁ-んァ-ン]', txt):
+                continue
+            parent_tag = await span_el.evaluate("el => el.parentElement.tagName")
+            if parent_tag.upper() != "H1":
+                continue
+            # Bỏ dấu ngoặc () hoặc （）
+            kana_clean = re.sub(r'^[\(（\s]+|[\)）\s]+$', '', txt).strip()
+            if kana_clean:
+                data["kana"] = kana_clean
+                log.info(f"    カナ: {kana_clean}")
+                break
+    except Exception as e:
+        log.debug(f"    カナ span.c-note method failed: {e}")
+
+    # ── Lấy 氏名 từ h3.c-title--type4 label + p.c-lines ─────────────────
+    # Cách 1: Tìm li.c-borderList__item chứa h3 text "氏名"
+    try:
+        items = await page.query_selector_all("li.c-borderList__item")
+        for li in items:
+            h = await li.query_selector("h3.c-title, h4.c-title, [class*='c-title']")
+            if h and (await h.inner_text()).strip() == "氏名":
+                p = await li.query_selector("p.c-lines")
+                if p:
+                    t = (await p.inner_text()).strip()
                     if t and 2 <= len(t) <= 20:
                         data["name"] = t
-                        log.debug(f"    氏名 via label+sibling: {t}")
+                        log.debug(f"    氏名 via li.c-borderList__item: {t}")
                         break
     except Exception as e:
-        log.debug(f"    氏名 label method failed: {e}")
+        log.debug(f"    氏名 li method failed: {e}")
 
-    # Cách 2: Tìm li chứa h3 text "氏名" rồi lấy p.c-lines trong li đó
+    # Cách 2: Tìm h3/h4 bất kỳ có text "氏名" rồi lấy sibling p.c-lines
     if not data["name"]:
         try:
-            items = await page.query_selector_all("li.c-borderList__item")
-            for li in items:
-                li_text = (await li.inner_text()).strip()
-                if li_text.startswith("氏名"):
-                    p = await li.query_selector("p.c-lines")
-                    if p:
-                        t = (await p.inner_text()).strip()
-                        t = re.sub(r'\s*[\(（][^\)）]{1,30}[\)）]', '', t).strip()
-                        if t and 2 <= len(t) <= 20:
-                            data["name"] = t
-                            log.debug(f"    氏名 via li.c-borderList__item: {t}")
-                            break
+            for sel in ['h3[class*="c-title"]', 'h4[class*="c-title"]', '[class*="c-title--type4"]']:
+                labels = await page.query_selector_all(sel)
+                for label_el in labels:
+                    if (await label_el.inner_text()).strip() == "氏名":
+                        sibling = await label_el.evaluate_handle(
+                            """el => {
+                                let next = el.nextElementSibling;
+                                while (next) {
+                                    if (next.matches('p.c-lines')) return next;
+                                    next = next.nextElementSibling;
+                                }
+                                return null;
+                            }"""
+                        )
+                        if sibling:
+                            t = (await sibling.inner_text()).strip()
+                            if t and 2 <= len(t) <= 20:
+                                data["name"] = t
+                                log.debug(f"    氏名 via h3+sibling: {t}")
+                                break
+                if data["name"]:
+                    break
         except Exception as e:
-            log.debug(f"    氏名 li method failed: {e}")
+            log.debug(f"    氏名 sibling method failed: {e}")
 
-    # Cách 3: Fallback — tên từ link trong danh sách bên trái (luôn đúng)
+    # Cách 3: Fallback — lấy tên thuần từ h1 (bỏ span)
+    if not data["name"]:
+        try:
+            h1_el = await page.query_selector('h1.c-title--type1')
+            if h1_el:
+                t = await h1_el.evaluate("""el => {
+                    const clone = el.cloneNode(true);
+                    clone.querySelectorAll('span').forEach(s => s.remove());
+                    return clone.innerText.trim();
+                }""")
+                t = re.sub(r'\s+', ' ', t).strip()
+                if t and 2 <= len(t) <= 20:
+                    data["name"] = t
+                    log.debug(f"    氏名 from h1 (no span): {t}")
+        except Exception as e:
+            log.debug(f"    氏名 h1 fallback failed: {e}")
+
+    # Cách 4: Fallback cuối — tên từ link danh sách bên trái
     if not data["name"]:
         try:
             link = await page.query_selector(
@@ -753,7 +825,7 @@ async def scrape_drawer(page, apply_number: str) -> dict:
                 t = (await link.inner_text()).strip()
                 if t and 2 <= len(t) <= 20:
                     data["name"] = t
-                    log.debug(f"    氏名 from list link text: {t}")
+                    log.debug(f"    氏名 from list link: {t}")
         except Exception:
             pass
 
@@ -848,16 +920,14 @@ async def scrape_drawer(page, apply_number: str) -> dict:
     except Exception as e:
         log.debug(f"    住所 scrape error: {e}")
 
-    # ── 応募求人名 (cột J) ───────────────────────────────────────────────
-    # HTML thực tế (ảnh 3):
-    #   <li class="c-borderList__item">
-    #     <h3 class="c-title ...">応募求人</h3>
-    #     <p class="c-lines">
-    #       <a href="/jobs/edit/8056-8676-0cku" class="c-link">リラクゼーション...</a>
-    #     </p>
-    #   </li>
-    # Phải giới hạn trong panel detail của ứng viên hiện tại,
-    # KHÔNG query toàn page (sẽ lấy nhầm job đầu tiên trong DOM).
+    # ── 学校名 (cột J) ──────────────────────────────────────────────────
+    # <h3 class="c-title ...">学校名</h3>
+    # <p class="c-lines">私立安田学園高等学校</p>
+    data["school"] = await get_field_by_label("学校名")
+
+    # ── 応募求人名 (cột K) ───────────────────────────────────────────────
+    # <h3 class="c-title ...">応募求人</h3>
+    # <p class="c-lines"><a href="/jobs/edit/...">求人名</a></p>
     data["job_name"] = ""
     try:
         items = await page.query_selector_all("li.c-borderList__item")
@@ -880,7 +950,12 @@ async def scrape_drawer(page, apply_number: str) -> dict:
     except Exception as e:
         log.debug(f"    応募求人名 scrape error: {e}")
 
-    # ── 対応ステータス (cột K) ───────────────────────────────────────────
+    # ── 現在の職業 (cột L) ───────────────────────────────────────────────
+    # <h3 class="c-title ...">現在の職業</h3>
+    # <p class="c-lines">アルバイト・パート</p>
+    data["current_job"] = await get_field_by_label("現在の職業")
+
+    # ── 対応ステータス (cột M) ───────────────────────────────────────────
     data["status"] = ""
     try:
         sel_el = await page.query_selector(
@@ -1056,27 +1131,25 @@ async def process_account_kbx(browser, account: dict, sheets_service, full_scan:
         if not ok:
             return
 
-        page_num      = 1
-        total_written = 0
+        # ── Thu thập tất cả ứng viên mới từ TẤT CẢ trang ───────────────
+        # - Quét hết tất cả trang, không dừng sớm
+        # - Bỏ qua ID đã có trong sheet (cột L)
+        # - Sau khi quét xong → sort cũ→mới → ghi batch 1 lần
+        all_new: list[dict] = []
+        page_num = 1
 
         while True:
             log.info(f"  📄 Trang {page_num}...")
 
             applicant_list = await get_applicant_links(page)
-            total_on_page  = len(applicant_list)
 
-            async for applicant in iter_new_applicants_kbx(page, page_num, existing_ids):
-                try:
-                    append_one_row_kbx(sheets_service, sheet_id, tab_name, applicant)
-                    existing_ids.add(applicant["apply_number"])
-                    total_written += 1
-                    log.info(f"    ✅ Đã ghi: {applicant['name']}")
-                except Exception as e:
-                    log.error(f"    ❌ Ghi sheet thất bại: {e}")
-
-            if total_on_page == 0:
+            if not applicant_list:
                 log.warning("  ⚠️  Trang trống — dừng")
                 break
+
+            async for applicant in iter_new_applicants_kbx(page, page_num, existing_ids):
+                all_new.append(applicant)
+                existing_ids.add(applicant["apply_number"])
 
             if not await has_next_page_kbx(page):
                 log.info(f"  ✅ Đã quét hết {page_num} trang (không còn 次へ)")
@@ -1085,6 +1158,26 @@ async def process_account_kbx(browser, account: dict, sheets_service, full_scan:
             page_num += 1
             log.info(f"  ➡️  Chuyển sang trang {page_num}...")
             await goto_applicant_page(page, actual_origin, page_num, corp_code)
+
+        # ── Sắp xếp cũ → mới rồi ghi batch ─────────────────────────────
+        def _sort_key(a: dict):
+            ds = a.get("apply_date", "")
+            try:
+                return datetime.strptime(ds, "%Y/%m/%d %H:%M")
+            except ValueError:
+                return datetime.min
+
+        all_new.sort(key=_sort_key)
+        log.info(f"  🆕 {len(all_new)} ứng viên mới — ghi theo thứ tự cũ → mới")
+
+        total_written = 0
+        if all_new:
+            try:
+                total_written = append_batch_kbx(sheets_service, sheet_id, tab_name, all_new)
+                for a in all_new:
+                    log.info(f"    ✅ {a['name']}  {a.get('apply_date', '')}")
+            except Exception as e:
+                log.error(f"    ❌ Ghi batch thất bại: {e}")
 
         log.info(f"  🆕 Tổng đã ghi: {total_written} ứng viên")
 
