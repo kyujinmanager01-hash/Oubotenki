@@ -1,0 +1,8 @@
+credentials/
+config/
+logs/
+*.xlsx
+*.xls
+__pycache__/
+.env
+*.pyc
