@@ -1,7 +1,7 @@
 name: Tu dong chay scraper
 on:
-  schedule:
-    - cron: '*/30 * * * *'
+  repository_dispatch:
+    types: [trigger]
   workflow_dispatch:
 jobs:
   chay-script:
