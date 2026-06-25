@@ -28,51 +28,75 @@ FIX LOG:
            - Reload trang nếu phát hiện row bị mất
   [FIX-8] apply_date: thử nhiều selector + parse thêm các định dạng
   [FIX-9] apply_date: hỗ trợ format mới span.styles_dateTime__MPfnz (2026/5/26 13:34)
-  [FIX-13] Cột D–I (性別/生年月日/年齢/メール/電話/住所) bị rỗng:
-           AirWork đổi layout + đổi hash class CSS-module:
-             - hash class infoText đổi (styles_infoText__UN0fw → __Sznk8) →
-               KHÔNG hard-code hash nữa, dùng [class*="infoText"]
-             - icon "human" giờ có thêm <div class="styles_humanInfoColumn__..">
-               bọc giữa → toán tử '+' (adjacent) không khớp → phải dùng
-               '~' (general sibling) hoặc '~ div span'
-  [FIX-14] Ghi TRÙNG apply_id (cột N): Sheet lưu cột N dạng số, đọc lại bằng
-           FORMATTED_VALUE có thể trả "29,760,116" (có dấu phẩy) trong khi
-           apply_id scrape là "29760116" → dedup fail → ghi trùng. Sửa:
-             - Đọc cột N bằng UNFORMATTED_VALUE
-             - Chuẩn hoá apply_id qua _norm_id() (chỉ giữ chữ số) ở cả 2 phía
-             - Chống trùng ngay trong CÙNG 1 lần chạy (run_seen)
+  [FIX-13] Cột D–I (性別/生年月日/年齢/メール/電話/住所) rỗng: AirWork đổi layout +
+           hash class CSS-module:
+             - hash đổi styles_infoText__UN0fw → __Sznk8 → bỏ hard-code hash,
+               dùng [class*="infoText"]
+             - icon "human" thêm <div class="styles_humanInfoColumn__.."> bọc giữa
+               → '+' (adjacent) không khớp → dùng '~' (general sibling) + fallback
+  [FIX-14] Ghi TRÙNG apply_id (cột N): Sheet lưu cột N dạng số, đọc lại có dấu
+           phẩy (29,760,116) ≠ apply_id scrape (29760116) → dedup fail. Sửa:
+           đọc UNFORMATTED_VALUE + _norm_id (chỉ giữ chữ số) ở cả 2 phía +
+           run_seen chống trùng trong cùng 1 lần chạy.
+  [FIX-15] Tải CV (PDF レジュメ) về Drive + gắn link vào cột O:
+           - Mỗi công ty có folder Drive riêng, link để sẵn ở cột K tab マスター管理
+           - Khi modal đang mở: click tab 応募情報 → lấy link <a download> →
+             fetch PDF bằng page.request (cookie auth) → lưu tạm vào /resumes
+           - Upload PDF lên folder Drive (supportsAllDrives=True cho Shared Drive)
+             → ghi webViewLink vào cột O (レジュメ), xoá file tạm sau khi upload
+           - Cần thêm scope drive + service Drive (credentials đã bật Drive API)
+  [FIX-16] "Modal không xuất hiện (timeout)": scrape_modal cũ chờ cứng
+           MODAL_SEL chứa hash styles_container__BMWEr; AirWork đổi hash →
+           không khớp → báo timeout giả dù panel đã mở. Sửa: chờ trực tiếp
+           tên ứng viên (h1/title), fallback scope = cả page nếu hash đổi.
+  [FIX-17] Tên = "応募者" (placeholder) + báo "không có CV" oan: panel load chậm
+           (nhất khi có PDF レジュメ) → tên/link tải chưa render. Bản cũ chấp nhận
+           placeholder làm tên thật. Sửa:
+             - KHÔNG chấp nhận "応募者"/"候補者": chờ networkidle + retry; hết
+               lượt vẫn placeholder → trả {} để click_and_scrape() click lại
+             - download_resume: chờ link <a download> xuất hiện (tối đa ~12s)
+               trước khi kết luận không có CV
 """
 
 import asyncio
 import logging
+import os
 import re
 import sys
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urljoin
 
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload  # [FIX-15] upload CV lên Drive
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-BASE_DIR  = Path(__file__).parent
-CRED_FILE = BASE_DIR / "credentials" / "credentials.json"
-LOG_DIR   = BASE_DIR / "logs"
-LOG_FILE  = LOG_DIR / f"rpa_{datetime.now():%Y%m%d}.log"
+BASE_DIR   = Path(__file__).parent
+CRED_FILE  = BASE_DIR / "credentials" / "credentials.json"
+LOG_DIR    = BASE_DIR / "logs"
+RESUME_DIR = BASE_DIR / "resumes"   # [FIX-15] nơi lưu tạm CV trước khi upload Drive
+LOG_FILE   = LOG_DIR / f"rpa_{datetime.now():%Y%m%d}.log"
 
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+# [FIX-15] thêm scope Drive để upload CV (credentials đã bật Drive API)
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
 
 # ── Master Sheet config ───────────────────────────────────────────────────────
 MASTER_SHEET_ID = "1sCYbBWFU0ENhZrmlRMqZMomS--jaZT5YbPb-mu2ORno"
 MASTER_TAB      = "マスター管理"
 
-COL_COMPANY   = 1
-COL_ID        = 2
-COL_PW        = 3
-COL_MEDIA     = 4
-COL_SHEET_URL = 6
-COL_TAB_NAME  = 7
-COL_MEDIA_URL = 8
+COL_COMPANY      = 1
+COL_ID           = 2
+COL_PW           = 3
+COL_MEDIA        = 4
+COL_SHEET_URL    = 6
+COL_TAB_NAME     = 7
+COL_MEDIA_URL    = 8
+COL_DRIVE_FOLDER = 10   # [FIX-15] cột K = link folder Drive chứa CV của công ty
 
 ENTRIES_URL = "https://ats.rct.airwork.net/entries"
 
@@ -86,6 +110,7 @@ MODAL_EXTRA_WAIT_MS = 400 # ms chờ thêm nếu retry
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 LOG_DIR.mkdir(exist_ok=True)
+RESUME_DIR.mkdir(exist_ok=True)   # [FIX-15]
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -122,9 +147,32 @@ def extract_sheet_id(url: str) -> str:
     return url.strip()
 
 
+def extract_drive_folder_id(url: str) -> str:
+    """
+    [FIX-15] Lấy folder_id từ link Drive ở cột K, ví dụ:
+      https://drive.google.com/drive/folders/1LFUHzs8y-3VtbCYOCuuepG9gVmPuTmI8?usp=...
+      → 1LFUHzs8y-3VtbCYOCuuepG9gVmPuTmI8
+    Nếu người dùng dán thẳng folder_id thì trả về nguyên.
+    """
+    url = (url or "").strip()
+    if not url:
+        return ""
+    if "/folders/" in url:
+        return url.split("/folders/")[1].split("?")[0].split("/")[0].strip()
+    if "id=" in url:
+        return url.split("id=")[1].split("&")[0].strip()
+    return url
+
+
+def _safe_filename(name: str) -> str:
+    """[FIX-15] Bỏ ký tự không hợp lệ cho tên file (giữ chữ Nhật)."""
+    name = re.sub(r'[\\/:*?"<>|\r\n\t]+', "_", name or "").strip()
+    return name[:120] if name else "cv"
+
+
 def _norm_id(v) -> str:
     """
-    [FIX-14] Chuẩn hoá apply_id để so trùng: CHỈ giữ chữ số.
+    [FIX-14] Chuẩn hoá apply_id để so trùng: CHỉ giữ chữ số.
     Tránh lệch khi:
       - Sheet tự format số có dấu phẩy ngăn cách → "29,760,116"
       - Đọc UNFORMATTED_VALUE trả về kiểu int/float thay vì str
@@ -145,11 +193,19 @@ def get_sheets_service():
     return build("sheets", "v4", credentials=creds)
 
 
+def get_drive_service():
+    """[FIX-15] Service Drive để upload CV. Dùng chung credentials với Sheets."""
+    creds = service_account.Credentials.from_service_account_file(
+        str(CRED_FILE), scopes=SCOPES
+    )
+    return build("drive", "v3", credentials=creds)
+
+
 def read_master_accounts(service) -> list[dict]:
     try:
         result = service.spreadsheets().values().get(
             spreadsheetId=MASTER_SHEET_ID,
-            range=f"{MASTER_TAB}!A:I",
+            range=f"{MASTER_TAB}!A:K",   # [FIX-15] mở rộng tới cột K (folder Drive)
         ).execute()
         rows = result.get("values", [])
     except Exception as e:
@@ -158,32 +214,36 @@ def read_master_accounts(service) -> list[dict]:
 
     accounts = []
     for i, row in enumerate(rows[1:], start=2):
-        while len(row) <= COL_MEDIA_URL:
+        while len(row) <= COL_DRIVE_FOLDER:   # [FIX-15] đảm bảo có đủ cột K
             row.append("")
 
         media = row[COL_MEDIA].strip()
         if media != "AW":
             continue
 
-        company   = row[COL_COMPANY].strip()
-        id_val    = row[COL_ID].strip()
-        pw_val    = row[COL_PW].strip()
-        sheet_url = row[COL_SHEET_URL].strip()
-        tab_name  = row[COL_TAB_NAME].strip()
-        media_url = row[COL_MEDIA_URL].strip()
+        company      = row[COL_COMPANY].strip()
+        id_val       = row[COL_ID].strip()
+        pw_val       = row[COL_PW].strip()
+        sheet_url    = row[COL_SHEET_URL].strip()
+        tab_name     = row[COL_TAB_NAME].strip()
+        media_url    = row[COL_MEDIA_URL].strip()
+        drive_folder = row[COL_DRIVE_FOLDER].strip()   # [FIX-15] cột K
 
         if not all([id_val, pw_val, media_url, sheet_url]):
             log.warning(f"  ⚠️  Dòng {i} [{company}] thiếu thông tin — bỏ qua")
             continue
 
         accounts.append({
-            "company":   company,
-            "id":        id_val,
-            "pw":        pw_val,
-            "sheet_url": sheet_url,
-            "tab_name":  tab_name or "【AW】応募者リスト",
-            "media_url": media_url,
+            "company":      company,
+            "id":           id_val,
+            "pw":           pw_val,
+            "sheet_url":    sheet_url,
+            "tab_name":     tab_name or "【AW】応募者リスト",
+            "media_url":    media_url,
+            "drive_folder": drive_folder,   # [FIX-15]
         })
+        if not drive_folder:
+            log.warning(f"  ⚠️  Dòng {i} [{company}] thiếu folder Drive (cột K) — sẽ không upload CV")
         log.info(f"  ✓ Dòng {i}: [{company}] {id_val}")
 
     return accounts
@@ -281,6 +341,7 @@ def _to_row(applicant: dict) -> list:
         applicant.get("work_location", ""), # L
         applicant.get("status", ""),        # M
         applicant.get("apply_id", ""),      # N ← hidden dedup key
+        applicant.get("resume_url", ""),    # O ← [FIX-15] link CV trên Drive (レジュメ)
     ]
 
 
@@ -304,6 +365,50 @@ def append_batch(service, sheet_id: str, tab: str, applicants: list[dict]) -> in
 
     log.info(f"    📝 Ghi batch {len(values)} dòng từ dòng {next_row}")
     return len(values)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Google Drive — upload CV  [FIX-15]
+# ══════════════════════════════════════════════════════════════════════════════
+
+def upload_resume_to_drive(drive_service, folder_id: str, local_path: str,
+                           display_name: str) -> str:
+    """
+    [FIX-15] Upload 1 file PDF CV lên folder Drive của công ty, trả về link xem.
+
+    LƯU Ý quota: service account KHÔNG có dung lượng Drive riêng. Nếu folder
+    (cột K) nằm trong "My Drive" của 1 user, upload có thể lỗi
+    "storageQuotaExceeded". Cách chắc ăn: để folder trong 1 Shared Drive
+    (ドライブの共有) và share quyền Editor cho email service account. Hàm này
+    đã bật supportsAllDrives=True để hỗ trợ Shared Drive.
+    """
+    if not folder_id:
+        return ""
+    if not local_path or not os.path.exists(local_path):
+        return ""
+    try:
+        fname = _safe_filename(display_name) or os.path.basename(local_path)
+        if not fname.lower().endswith(".pdf"):
+            fname += ".pdf"
+        metadata = {"name": fname, "parents": [folder_id]}
+        media = MediaFileUpload(local_path, mimetype="application/pdf", resumable=False)
+        file = drive_service.files().create(
+            body=metadata,
+            media_body=media,
+            fields="id, webViewLink",
+            supportsAllDrives=True,   # hỗ trợ Shared Drive
+        ).execute()
+        link = file.get("webViewLink") or f"https://drive.google.com/file/d/{file.get('id')}/view"
+        log.info(f"    ☁️  Upload CV: {fname} → {link}")
+        # Xoá file tạm sau khi upload thành công để tránh phình ổ đĩa
+        try:
+            os.remove(local_path)
+        except Exception:
+            pass
+        return link
+    except Exception as e:
+        log.warning(f"    ⚠️  Upload CV Drive thất bại ({local_path}): {e}")
+        return ""
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -501,6 +606,110 @@ async def close_modal(page):
         await page.wait_for_timeout(200)
 
 
+async def download_resume(page, apply_id: str, name: str) -> str:
+    """
+    [FIX-15] Tải PDF レジュメ của ứng viên về local KHI MODAL ĐANG MỞ.
+    Gọi ngay sau khi scrape xong, TRƯỚC close_modal.
+
+    Luồng theo UI AirWork:
+      1. Click tab 応募情報 (đảm bảo đang ở tab có khối レジュメ)
+         <button data-la="overlay_entry_detail_tab_application_click">応募情報</button>
+      2. Lấy link tải trực tiếp từ thẻ <a download href=".../preview_file_pdf/...">
+         rồi fetch bằng page.request (chia sẻ cookie đăng nhập) → nhanh, ổn định.
+      3. Fallback: click nút download (img download.svg) và intercept Playwright
+         download nếu không tìm thấy thẻ <a download>.
+
+    Trả về đường dẫn file local đã tải, hoặc "" nếu ứng viên không có CV.
+    """
+    # 1. Đảm bảo đang ở tab 応募情報
+    try:
+        tab = await page.query_selector(
+            'button[data-la="overlay_entry_detail_tab_application_click"]'
+        )
+        if tab:
+            await tab.click()
+            await page.wait_for_timeout(400)
+    except Exception:
+        pass
+
+    safe_name = _safe_filename(name) or apply_id
+
+    RESUME_LINK_SEL = (
+        'a[download][href*="preview_file_pdf"], '
+        'a[href*="preview_file_pdf"], '
+        'a[class*="toolbarLink"][download]'
+    )
+
+    # [FIX-17] Khối レジュメ load chậm (nhất là khi có PDF) → CHỜ link tải xuất
+    # hiện trước, tránh kết luận "không có CV" oan khi panel chưa render xong.
+    try:
+        await page.wait_for_selector(RESUME_LINK_SEL, state="attached", timeout=8_000)
+    except PlaywrightTimeout:
+        # Chờ network ổn định rồi thử lại 1 lần (panel có thể vẫn đang tải)
+        try:
+            await page.wait_for_load_state("networkidle", timeout=4_000)
+        except PlaywrightTimeout:
+            pass
+        try:
+            await page.wait_for_selector(RESUME_LINK_SEL, state="attached", timeout=4_000)
+        except PlaywrightTimeout:
+            pass
+
+    # 2. Thử lấy href trực tiếp từ thẻ <a download> rồi fetch
+    try:
+        a_el = await page.query_selector(RESUME_LINK_SEL)
+        if a_el:
+            href = await a_el.get_attribute("href")
+            if href:
+                full_url = urljoin(page.url, href)
+                resp = await page.request.get(full_url, timeout=30_000)
+                if resp.ok:
+                    body = await resp.body()
+                    if body and body[:4] == b"%PDF":   # đúng là file PDF
+                        local_path = str(RESUME_DIR / f"{apply_id}_{safe_name}.pdf")
+                        with open(local_path, "wb") as f:
+                            f.write(body)
+                        log.info(f"    📄 Tải CV: {os.path.basename(local_path)}")
+                        return local_path
+                    else:
+                        log.debug(f"    CV fetch không phải PDF (ID={apply_id})")
+                else:
+                    log.debug(f"    CV fetch HTTP {resp.status} (ID={apply_id})")
+    except Exception as e:
+        log.debug(f"    Tải CV trực tiếp lỗi (ID={apply_id}): {e}")
+
+    # 3. Fallback: click nút download và intercept
+    try:
+        async with page.expect_download(timeout=10_000) as dl_info:
+            clicked = False
+            for sel in [
+                'a[download]',
+                'img[src*="download"]',
+                'button[data-la*="resume"]',
+                '[aria-label*="ダウンロード"]',
+                'a:has-text("ダウンロード")',
+            ]:
+                el = await page.query_selector(sel)
+                if el:
+                    await el.click()
+                    clicked = True
+                    break
+            if not clicked:
+                log.info(f"    ℹ️  Ứng viên ID={apply_id} không có CV để tải")
+                return ""
+        download = await dl_info.value
+        local_path = str(RESUME_DIR / f"{apply_id}_{safe_name}.pdf")
+        await download.save_as(local_path)
+        log.info(f"    📄 Tải CV (fallback): {os.path.basename(local_path)}")
+        return local_path
+    except PlaywrightTimeout:
+        log.info(f"    ℹ️  Ứng viên ID={apply_id} không có CV để tải")
+        return ""
+    except Exception as e:
+        log.warning(f"    ⚠️  Không tải được CV (ID={apply_id}): {e}")
+        return ""
+
+
 async def _dump_modal_debug(page, apply_id: str, attempt: int):
     """
     [FIX-6] Dump HTML + screenshot khi modal không lấy được tên.
@@ -565,10 +774,14 @@ async def _get_icon_text(scope, data_type: str) -> str:
 
 async def scrape_modal(page, apply_id: str) -> dict:
     """
-    [FIX-10] AirWork đổi UI -> class CSS-module hash (styles_xxx__HASH) đổi theo
-    mỗi lần deploy, nên KHÔNG còn gate cứng theo MODAL_SEL (hash dễ vỡ).
-    Thay vào đó: chờ trực tiếp h1 tên ứng viên xuất hiện (đã có fallback
-    [class*='title'] / h1 chung) -> không phụ thuộc hash CSS module nào cả.
+    [FIX-6]  Đọc panel chi tiết với wait ổn định + nhiều selector dự phòng cho 氏名.
+    [FIX-16] KHÔNG còn chờ cứng MODAL_SEL ('div.styles_container__BMWEr[role=dialog]').
+             AirWork đổi hash CSS-module (styles_container__BMWEr đổi mỗi lần
+             deploy) → selector này không khớp → báo "Modal không xuất hiện" GIẢ
+             dù panel chi tiết thật ra ĐÃ mở. Sửa: chờ TRỰC TIẾP tên ứng viên
+             (h1/title) xuất hiện, không gate qua container hash. Nếu MODAL_SEL
+             còn khớp thì dùng làm scope; không thì fallback dùng cả page.
+    Nếu tên vẫn không lấy được → trả về {} để caller có thể retry.
     """
     data = {"apply_id": apply_id}
 
@@ -583,7 +796,8 @@ async def scrape_modal(page, apply_id: str) -> dict:
         "h1",
     ]
 
-    # Chờ BẤT KỲ selector tên nào xuất hiện, tối đa ~8s -> không gate qua container
+    # [FIX-16] Chờ BẤT KỲ selector tên nào xuất hiện (panel đã mở) — không gate
+    # qua container hash. Mỗi selector thử tối đa 1.5s, tổng tối đa ~12s.
     name_appeared = False
     for sel in NAME_SELECTORS:
         try:
@@ -596,14 +810,13 @@ async def scrape_modal(page, apply_id: str) -> dict:
         try:
             await page.wait_for_selector("h1", state="visible", timeout=6_500)
         except PlaywrightTimeout:
-            log.warning("    ⚠️  Không thấy tên ứng viên xuất hiện (timeout)")
+            log.warning("    ⚠️  Panel chi tiết không xuất hiện (timeout)")
             return {}
 
-    # Cố lấy modal container theo selector cũ -> dùng nếu còn khớp,
-    # nếu không khớp (hash đổi) thì fallback dùng page làm scope luôn.
+    # [FIX-16] Dùng MODAL_SEL làm scope nếu còn khớp; nếu hash đổi → fallback page
     modal = await page.query_selector(MODAL_SEL)
     if not modal:
-        modal = page  # fallback: query trực tiếp trên page
+        modal = page
 
     async def mtext(sel: str) -> str:
         try:
@@ -620,34 +833,55 @@ async def scrape_modal(page, apply_id: str) -> dict:
             pass
         return ""
 
+    async def mtext_modal_only(sel: str) -> str:
+        """Chỉ query trong modal — không fallback ra page.
+        Dùng cho 応募日時 để tránh lấy nhầm phần tử ngoài modal."""
+        try:
+            el = await modal.query_selector(sel)
+            if el:
+                return (await el.inner_text()).strip()
+        except Exception:
+            pass
+        return ""
+
     # ── 氏名 ──────────────────────────────────────────────────────────────
-    # [FIX-12] FIX-11 từng "chấp nhận" placeholder "応募者" làm tên thật khi
-    # retry hết mà vẫn vậy -> SAI: thực tế nó luôn là race condition (load
-    # chậm vì có resume PDF đính kèm), không phải tên thật.
-    # Sửa: KHÔNG bao giờ chấp nhận placeholder. Nếu vẫn là placeholder sau
-    # khi chờ -> trả về {} để click_and_scrape() retry lại bằng cách
-    # CLICK LẠI TỪ ĐẦU (fresh DOM, có thời gian load nhiều hơn 1 lần thử
-    # đơn lẻ có thể cho được). Dùng wait_for_load_state("networkidle") thay
-    # cho sleep cố định -> tự thích nghi theo tốc độ load thật của panel.
-    PLACEHOLDER_NAMES = {"応募者", "応募者様"}
+    # [FIX-17] Panel load chậm (đặc biệt khi có PDF レジュメ) → ban đầu tên hiển
+    # thị là placeholder "応募者". Bản cũ CHẤP NHẬN placeholder làm tên thật →
+    # vừa ghi sai tên, vừa hụt CV (vì link tải cũng chưa load).
+    # Sửa: KHÔNG bao giờ chấp nhận placeholder. Nếu gặp placeholder → chờ
+    # network ổn định + thử lại; hết lượt vẫn placeholder → trả {} để
+    # click_and_scrape() click lại từ đầu (panel có thêm thời gian load).
+    NAME_SELECTORS = [
+        "h1.styles_title__Gs8Yk",
+        "h1[class*='title']",
+        "h1[class*='name']",
+        "h1[class*='applicant']",
+        "[class*='applicantName']",
+        "[class*='candidateName']",
+        "[class*='userName']",
+        "h1",
+    ]
+    PLACEHOLDER_NAMES = {"応募者", "応募者様", "候補者"}
+
+    def _valid_name(v: str) -> bool:
+        return bool(v) and v not in PLACEHOLDER_NAMES and 2 <= len(v) <= 30 \
+            and "http" not in v and "\n" not in v
 
     async def _read_name_retry(sel: str) -> str:
-        for attempt in range(3):
+        for _ in range(3):
             val = await mtext(sel)
-            if val and val not in PLACEHOLDER_NAMES and 2 <= len(val) <= 30 \
-               and "http" not in val and "\n" not in val:
+            if _valid_name(val):
                 return val
             if val in PLACEHOLDER_NAMES:
-                # Panel có thể đang load nặng hơn (vd có resume PDF) -> chờ
-                # network ổn định thay vì sleep cố định cứng nhắc
+                # Panel đang load (vd có resume PDF) → chờ network ổn định rồi thử lại
                 try:
                     await page.wait_for_load_state("networkidle", timeout=4_000)
                 except PlaywrightTimeout:
                     pass
                 await page.wait_for_timeout(300)
                 continue
-            return ""  # giá trị khác (rỗng / không hợp lệ) -> thử selector kế
-        return ""  # hết 3 lần vẫn là placeholder -> THẤT BẠI, không chấp nhận
+            return ""   # giá trị khác (rỗng/không hợp lệ) → thử selector kế
+        return ""       # hết 3 lần vẫn placeholder → THẤT BẠI, không chấp nhận
 
     data["name"] = ""
     for sel in NAME_SELECTORS:
@@ -661,7 +895,7 @@ async def scrape_modal(page, apply_id: str) -> dict:
         try:
             for h1 in await modal.query_selector_all("h1, h2"):
                 t = (await h1.inner_text()).strip()
-                if t and t not in PLACEHOLDER_NAMES and 2 <= len(t) <= 30 and "http" not in t:
+                if _valid_name(t):
                     data["name"] = t
                     break
         except Exception:
@@ -669,7 +903,7 @@ async def scrape_modal(page, apply_id: str) -> dict:
 
     if not data["name"]:
         # Bao gồm cả trường hợp vẫn còn placeholder "応募者" sau retry
-        # -> trả {} để click_and_scrape() tự click lại từ đầu (fresh attempt)
+        # → trả {} để click_and_scrape() tự click lại từ đầu (fresh attempt)
         return {}
 
     # ── カナ ──────────────────────────────────────────────────────────────
@@ -681,22 +915,39 @@ async def scrape_modal(page, apply_id: str) -> dict:
             data["kana"] = parse_kana(val)
             break
 
+    # ── 応募日時 ──────────────────────────────────────────────────────────
+    # Lấy từ danh sách (span.styles_dateTime__MPfnz trong row) TRƯỚC khi click
+    # → thời gian đúng, không bị lệch múi giờ. Xem get_row_data() + caller.
+    # scrape_modal KHÔNG lấy apply_date nữa; caller sẽ ghi đè sau khi return.
     data["apply_date"] = ""
 
-    # ── 年齢・生年月日・性別・Email・Tel・住所 (dùng data-type, bền hơn class hash) ──
-    # [FIX-13] _get_icon_text đã sửa để bắt được layout mới (div bọc + hash đổi)
+    # ── 年齢・生年月日・性別 ───────────────────────────────────────────────
+    # <span data-type="human"></span>
+    # <span class="styles_infoText__UN0fw">43歳（1982年8月19日生まれ）／男性</span>
+    # E = 生年月日 YYYY/MM/DD,  F = 年齢 (数字のみ),  D = 性別
     bio_text = await _get_icon_text(modal, "human")
-    if not bio_text and modal is not page:
-        bio_text = await _get_icon_text(page, "human")
-    data["gender"]   = parse_gender(bio_text)    # D ← 男性
-    data["birthday"] = parse_birthday(bio_text)  # E ← 1963/02/17
-    data["age"]      = parse_age(bio_text)        # F ← 63
+    data["gender"]   = parse_gender(bio_text)
+    data["birthday"] = parse_birthday(bio_text)
+    data["age"]      = parse_age(bio_text)
 
-    data["email"]   = await _get_icon_text(modal, "mail") or await _get_icon_text(page, "mail")        # G
-    data["tel"]     = await _get_icon_text(modal, "call") or await _get_icon_text(page, "call")        # H
-    data["address"] = await _get_icon_text(modal, "address") or await _get_icon_text(page, "address")  # I
+    # ── Email ─────────────────────────────────────────────────────────────
+    # <span data-type="mail"></span>
+    # <span class="styles_infoText__UN0fw">xxx@gmail.com</span>
+    data["email"] = await _get_icon_text(modal, "mail")
+
+    # ── 電話番号 ──────────────────────────────────────────────────────────
+    # <span data-type="call"></span>
+    # <span class="styles_infoText__UN0fw">08056915963</span>
+    data["tel"] = await _get_icon_text(modal, "call")
+
+    # ── 住所 ─────────────────────────────────────────────────────────────
+    # <span data-type="address"></span>
+    # <span class="styles_infoText__UN0fw">宮城県 東松島市...</span>
+    # ⚠️ Chỉ lấy từ icon address — không fallback heuristic để tránh ghi nhầm số điện thoại
+    data["address"] = await _get_icon_text(modal, "address")
 
     # ── 応募求人名 ────────────────────────────────────────────────────────
+    # <a class="styles_jobTitleLink__YzGop ...">フィットネスジムの受付・ご案内スタッフ</a>
     data["job_name"] = ""
     for sel in [
         'a.styles_jobTitleLink__YzGop',
@@ -706,11 +957,13 @@ async def scrape_modal(page, apply_id: str) -> dict:
     ]:
         val = await mtext(sel)
         if val:
+            # Strip prefix kiểu [11263686] mà AirWork đôi khi thêm vào
             val = re.sub(r"^\[\d+\]\s*", "", val).strip()
             data["job_name"] = val
             break
 
-    # ── 雇用形態 ──────────────────────────────────────────────────────────
+    # ── 雇用形態 (col K) ──────────────────────────────────────────────────
+    # <span class="styles_jobLabel__6SC9n">アルバイト・パート</span>
     data["employment"] = ""
     for sel in [
         'span.styles_jobLabel__6SC9n',
@@ -722,7 +975,8 @@ async def scrape_modal(page, apply_id: str) -> dict:
             data["employment"] = val.strip()
             break
 
-    # ── 応募先 ────────────────────────────────────────────────────────────
+    # ── 応募先 (col L) ────────────────────────────────────────────────────
+    # <span class="styles_jobCaption__hJsiu">アッティーボジム高見プラザ店</span>
     data["work_location"] = ""
     for sel in [
         'span.styles_jobCaption__hJsiu',
@@ -856,7 +1110,7 @@ async def iter_new_applicants(page, page_num: int, existing_ids: set, full_scan:
 # Process 1 account
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def process_account(browser, account: dict, sheets_service, full_scan: bool):
+async def process_account(browser, account: dict, sheets_service, drive_service, full_scan: bool):
     company   = account["company"]
     username  = account["id"]
     password  = account["pw"]
@@ -868,9 +1122,14 @@ async def process_account(browser, account: dict, sheets_service, full_scan: boo
     log.info(f"🏢 {company}  ({'全件スキャン' if full_scan else '新着チェック'})")
     log.info(f"   ID : {username}")
 
-    sheet_id     = extract_sheet_id(sheet_url)
-    existing_ids = get_existing_ids(sheets_service, sheet_id, tab_name)
+    sheet_id        = extract_sheet_id(sheet_url)
+    drive_folder_id = extract_drive_folder_id(account.get("drive_folder", ""))   # [FIX-15]
+    existing_ids    = get_existing_ids(sheets_service, sheet_id, tab_name)
     log.info(f"  📊 Sheet đã có {len(existing_ids)} ứng viên (theo apply_id)")
+    if drive_folder_id:
+        log.info(f"  📁 Folder Drive CV: {drive_folder_id}")
+    else:
+        log.warning("  ⚠️  Không có folder Drive (cột K) — sẽ KHÔNG tải/ghi CV cho công ty này")
 
     context = await browser.new_context(
         viewport={"width": 1440, "height": 900},
@@ -942,6 +1201,14 @@ async def process_account(browser, account: dict, sheets_service, full_scan: boo
                     detail["apply_date"] = apply_date
 
                 run_seen.add(nid)   # [FIX-14] đánh dấu đã xử lý trong lần chạy này
+
+                # [FIX-15] Tải CV khi modal ĐANG MỞ (trước close_modal)
+                detail["resume_local"] = ""
+                if drive_folder_id:
+                    detail["resume_local"] = await download_resume(
+                        page, apply_id, detail.get("name", "")
+                    )
+
                 log.info(f"    [{i+1}] ✓ {detail['name']}  {detail.get('apply_date', '')}")
                 all_new.append(detail)
 
@@ -971,6 +1238,20 @@ async def process_account(browser, account: dict, sheets_service, full_scan: boo
 
         all_new.sort(key=_sort_key)
         log.info(f"  🆕 {len(all_new)} ứng viên mới — ghi theo thứ tự cũ → mới")
+
+        # ── [FIX-15] Upload CV lên Drive + gắn link vào cột O ────────────
+        if drive_folder_id and all_new:
+            n_up = 0
+            for a in all_new:
+                lp = a.get("resume_local", "")
+                if lp:
+                    disp = f"{a.get('name','')}_{a.get('apply_id','')}"
+                    a["resume_url"] = upload_resume_to_drive(
+                        drive_service, drive_folder_id, lp, disp
+                    )
+                    if a["resume_url"]:
+                        n_up += 1
+            log.info(f"  ☁️  Upload {n_up}/{len(all_new)} CV lên Drive")
 
         # ── Ghi batch 1 lần duy nhất (thay vì N lần API call) ────────────
         total_written = 0
@@ -1004,6 +1285,7 @@ async def main(headless: bool = True, full_scan: bool = False):
     log.info(f"{'#'*60}")
 
     sheets_service = get_sheets_service()
+    drive_service  = get_drive_service()   # [FIX-15]
 
     log.info(f"\n📋 Đọc danh sách AW từ Sheet マスター管理...")
     accounts = read_master_accounts(sheets_service)
@@ -1016,7 +1298,7 @@ async def main(headless: bool = True, full_scan: bool = False):
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=headless)
         for account in accounts:
-            await process_account(browser, account, sheets_service, full_scan)
+            await process_account(browser, account, sheets_service, drive_service, full_scan)
         await browser.close()
 
     log.info("\n✅ Hoàn thành tất cả!")
