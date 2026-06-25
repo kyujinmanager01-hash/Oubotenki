@@ -28,6 +28,19 @@ FIX LOG:
            - Reload trang nếu phát hiện row bị mất
   [FIX-8] apply_date: thử nhiều selector + parse thêm các định dạng
   [FIX-9] apply_date: hỗ trợ format mới span.styles_dateTime__MPfnz (2026/5/26 13:34)
+  [FIX-13] Cột D–I (性別/生年月日/年齢/メール/電話/住所) bị rỗng:
+           AirWork đổi layout + đổi hash class CSS-module:
+             - hash class infoText đổi (styles_infoText__UN0fw → __Sznk8) →
+               KHÔNG hard-code hash nữa, dùng [class*="infoText"]
+             - icon "human" giờ có thêm <div class="styles_humanInfoColumn__..">
+               bọc giữa → toán tử '+' (adjacent) không khớp → phải dùng
+               '~' (general sibling) hoặc '~ div span'
+  [FIX-14] Ghi TRÙNG apply_id (cột N): Sheet lưu cột N dạng số, đọc lại bằng
+           FORMATTED_VALUE có thể trả "29,760,116" (có dấu phẩy) trong khi
+           apply_id scrape là "29760116" → dedup fail → ghi trùng. Sửa:
+             - Đọc cột N bằng UNFORMATTED_VALUE
+             - Chuẩn hoá apply_id qua _norm_id() (chỉ giữ chữ số) ở cả 2 phía
+             - Chống trùng ngay trong CÙNG 1 lần chạy (run_seen)
 """
 
 import asyncio
@@ -109,6 +122,18 @@ def extract_sheet_id(url: str) -> str:
     return url.strip()
 
 
+def _norm_id(v) -> str:
+    """
+    [FIX-14] Chuẩn hoá apply_id để so trùng: CHỈ giữ chữ số.
+    Tránh lệch khi:
+      - Sheet tự format số có dấu phẩy ngăn cách → "29,760,116"
+      - Đọc UNFORMATTED_VALUE trả về kiểu int/float thay vì str
+    Cả lúc đọc từ Sheet lẫn lúc so sánh đều đi qua hàm này → đảm bảo
+    so trùng đồng nhất, không bao giờ ghi trùng vì khác định dạng.
+    """
+    return re.sub(r"\D", "", str(v))
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Google Sheets
 # ══════════════════════════════════════════════════════════════════════════════
@@ -166,17 +191,23 @@ def read_master_accounts(service) -> list[dict]:
 
 def get_existing_ids(service, sheet_id: str, tab: str) -> set:
     """
-    [FIX-2] Dùng apply_id (cột N = hidden key) làm dedup key thay vì name+date.
+    [FIX-2]  Dùng apply_id (cột N = hidden key) làm dedup key thay vì name+date.
+    [FIX-14] Đọc UNFORMATTED_VALUE + chuẩn hoá _norm_id để tránh ghi trùng
+             do Sheet format số có dấu phẩy (29,760,116 ≠ 29760116).
     """
     existing = set()
     try:
         result = service.spreadsheets().values().get(
             spreadsheetId=sheet_id,
             range=f"{tab}!N3:N",
+            valueRenderOption="UNFORMATTED_VALUE",  # [FIX-14] không lấy số đã format
         ).execute()
         for row in result.get("values", []):
-            if row and row[0].strip():
-                existing.add(row[0].strip())
+            if not row:
+                continue
+            nid = _norm_id(row[0])
+            if nid:
+                existing.add(nid)
     except Exception as e:
         log.warning(f"  ⚠️  Không đọc được cột ID Sheet: {e}")
     return existing
@@ -487,55 +518,92 @@ async def _dump_modal_debug(page, apply_id: str, attempt: int):
         log.warning(f"    ⚠️  Không dump được debug: {e}")
 
 
-async def _get_icon_text(modal, data_type: str) -> str:
+async def _get_icon_text(scope, data_type: str) -> str:
     """
-    Lấy text từ span.styles_infoText__UN0fw nằm ngay sau
-    span[data-type="{data_type}"] — dùng cho call/mail/address/human.
+    Lấy text gắn với icon data-type (human/mail/call/address).
+
+    [FIX-13] AirWork đổi layout + đổi hash class CSS-module. Element MỚI:
+
+      性別/生年月日/年齢 (human) — CÓ <div> bọc ở giữa:
+        <span class="styles_icon__nkRPX" data-type="human"></span>
+        <div class="styles_humanInfoColumn__fUcV_">
+            <span class="styles_infoText__Sznk8">63歳（1963年2月17日生まれ）／男性</span>
+        </div>
+        <span class="styles_infoText__Sznk8">63歳（1963年2月17日生まれ）／男性</span>
+
+      メール/電話/住所 (mail/call/address) — span liền kề:
+        <span class="styles_icon__nkRPX" data-type="mail"></span>
+        <span class="styles_infoText__Sznk8">...@indeedemail.com</span>
+
+    Hai điểm vỡ so với code cũ:
+      1) hash class đổi: styles_infoText__UN0fw → styles_infoText__Sznk8
+         → KHÔNG hard-code hash nữa, dùng [class*="infoText"]
+      2) 'human' có <div> chen giữa → toán tử '+' (adjacent sibling) KHÔNG
+         khớp → dùng '~' (general sibling, bắt cả sibling liền kề lẫn cách xa)
+         và thêm fallback '~ div span' cho trường hợp text nằm trong <div>.
     """
-    try:
-        el = await modal.query_selector(
-            f'span[data-type="{data_type}"] + span.styles_infoText__UN0fw'
-        )
-        if el:
-            return (await el.inner_text()).strip()
-    except Exception:
-        pass
+    selectors = [
+        # General sibling: bắt span infoText đứng sau icon — đúng cho cả layout
+        # cũ (span liền kề) và mới (human có div chen giữa, vẫn còn span sibling)
+        f'span[data-type="{data_type}"] ~ span[class*="infoText"]',
+        # Fallback: infoText nằm trong <div> sibling của icon (layout human mới)
+        f'span[data-type="{data_type}"] ~ div span[class*="infoText"]',
+        # Fallback layout cũ: adjacent sibling trực tiếp
+        f'span[data-type="{data_type}"] + span[class*="infoText"]',
+    ]
+    for sel in selectors:
+        try:
+            el = await scope.query_selector(sel)
+            if el:
+                txt = (await el.inner_text()).strip()
+                if txt:
+                    return txt
+        except Exception:
+            continue
     return ""
 
 
 async def scrape_modal(page, apply_id: str) -> dict:
     """
-    [FIX-6] Đọc modal với wait ổn định hơn + nhiều selector dự phòng cho 氏名.
-    Nếu tên vẫn không lấy được → trả về {} để caller có thể retry.
+    [FIX-10] AirWork đổi UI -> class CSS-module hash (styles_xxx__HASH) đổi theo
+    mỗi lần deploy, nên KHÔNG còn gate cứng theo MODAL_SEL (hash dễ vỡ).
+    Thay vào đó: chờ trực tiếp h1 tên ứng viên xuất hiện (đã có fallback
+    [class*='title'] / h1 chung) -> không phụ thuộc hash CSS module nào cả.
     """
     data = {"apply_id": apply_id}
 
-    # Chờ modal xuất hiện VÀ ổn định (không chỉ xuất hiện)
-    try:
-        await page.wait_for_selector(MODAL_SEL, state="visible", timeout=8_000)
-    except PlaywrightTimeout:
-        log.warning("    ⚠️  Modal không xuất hiện (timeout)")
-        return {}
+    NAME_SELECTORS = [
+        "h1.styles_title__Gs8Yk",
+        "h1[class*='title']",
+        "h1[class*='name']",
+        "h1[class*='applicant']",
+        "[class*='applicantName']",
+        "[class*='candidateName']",
+        "[class*='userName']",
+        "h1",
+    ]
 
-    # Chờ h1 tên thực sự load xong bên trong modal
-    # (modal container xuất hiện nhanh nhưng nội dung load async)
-    try:
-        await page.wait_for_selector(
-            f"{MODAL_SEL} h1.styles_title__Gs8Yk",
-            state="visible",
-            timeout=6_000,
-        )
-    except PlaywrightTimeout:
-        # Fallback: chờ bất kỳ h1 nào trong modal
+    # Chờ BẤT KỲ selector tên nào xuất hiện, tối đa ~8s -> không gate qua container
+    name_appeared = False
+    for sel in NAME_SELECTORS:
         try:
-            await page.wait_for_selector(f"{MODAL_SEL} h1", state="visible", timeout=3_000)
+            await page.wait_for_selector(sel, state="visible", timeout=1_500)
+            name_appeared = True
+            break
         except PlaywrightTimeout:
-            pass
+            continue
+    if not name_appeared:
+        try:
+            await page.wait_for_selector("h1", state="visible", timeout=6_500)
+        except PlaywrightTimeout:
+            log.warning("    ⚠️  Không thấy tên ứng viên xuất hiện (timeout)")
+            return {}
 
+    # Cố lấy modal container theo selector cũ -> dùng nếu còn khớp,
+    # nếu không khớp (hash đổi) thì fallback dùng page làm scope luôn.
     modal = await page.query_selector(MODAL_SEL)
     if not modal:
-        log.warning("    ⚠️  Không query được modal element")
-        return {}
+        modal = page  # fallback: query trực tiếp trên page
 
     async def mtext(sel: str) -> str:
         try:
@@ -552,32 +620,39 @@ async def scrape_modal(page, apply_id: str) -> dict:
             pass
         return ""
 
-    async def mtext_modal_only(sel: str) -> str:
-        """Chỉ query trong modal — không fallback ra page.
-        Dùng cho 応募日時 để tránh lấy nhầm phần tử ngoài modal."""
-        try:
-            el = await modal.query_selector(sel)
-            if el:
-                return (await el.inner_text()).strip()
-        except Exception:
-            pass
-        return ""
-
     # ── 氏名 ──────────────────────────────────────────────────────────────
+    # [FIX-12] FIX-11 từng "chấp nhận" placeholder "応募者" làm tên thật khi
+    # retry hết mà vẫn vậy -> SAI: thực tế nó luôn là race condition (load
+    # chậm vì có resume PDF đính kèm), không phải tên thật.
+    # Sửa: KHÔNG bao giờ chấp nhận placeholder. Nếu vẫn là placeholder sau
+    # khi chờ -> trả về {} để click_and_scrape() retry lại bằng cách
+    # CLICK LẠI TỪ ĐẦU (fresh DOM, có thời gian load nhiều hơn 1 lần thử
+    # đơn lẻ có thể cho được). Dùng wait_for_load_state("networkidle") thay
+    # cho sleep cố định -> tự thích nghi theo tốc độ load thật của panel.
+    PLACEHOLDER_NAMES = {"応募者", "応募者様"}
+
+    async def _read_name_retry(sel: str) -> str:
+        for attempt in range(3):
+            val = await mtext(sel)
+            if val and val not in PLACEHOLDER_NAMES and 2 <= len(val) <= 30 \
+               and "http" not in val and "\n" not in val:
+                return val
+            if val in PLACEHOLDER_NAMES:
+                # Panel có thể đang load nặng hơn (vd có resume PDF) -> chờ
+                # network ổn định thay vì sleep cố định cứng nhắc
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=4_000)
+                except PlaywrightTimeout:
+                    pass
+                await page.wait_for_timeout(300)
+                continue
+            return ""  # giá trị khác (rỗng / không hợp lệ) -> thử selector kế
+        return ""  # hết 3 lần vẫn là placeholder -> THẤT BẠI, không chấp nhận
+
     data["name"] = ""
-    NAME_SELECTORS = [
-        "h1.styles_title__Gs8Yk",
-        "h1[class*='title']",
-        "h1[class*='name']",
-        "h1[class*='applicant']",
-        "[class*='applicantName']",
-        "[class*='candidateName']",
-        "[class*='userName']",
-        "h1",
-    ]
     for sel in NAME_SELECTORS:
-        val = await mtext(sel)
-        if val and 2 <= len(val) <= 30 and "http" not in val and "\n" not in val:
+        val = await _read_name_retry(sel)
+        if val:
             data["name"] = val
             log.debug(f"    氏名 via [{sel}]: {val}")
             break
@@ -586,13 +661,15 @@ async def scrape_modal(page, apply_id: str) -> dict:
         try:
             for h1 in await modal.query_selector_all("h1, h2"):
                 t = (await h1.inner_text()).strip()
-                if t and 2 <= len(t) <= 30 and "http" not in t:
+                if t and t not in PLACEHOLDER_NAMES and 2 <= len(t) <= 30 and "http" not in t:
                     data["name"] = t
                     break
         except Exception:
             pass
 
     if not data["name"]:
+        # Bao gồm cả trường hợp vẫn còn placeholder "応募者" sau retry
+        # -> trả {} để click_and_scrape() tự click lại từ đầu (fresh attempt)
         return {}
 
     # ── カナ ──────────────────────────────────────────────────────────────
@@ -604,39 +681,22 @@ async def scrape_modal(page, apply_id: str) -> dict:
             data["kana"] = parse_kana(val)
             break
 
-    # ── 応募日時 ──────────────────────────────────────────────────────────
-    # Lấy từ danh sách (span.styles_dateTime__MPfnz trong row) TRƯỚC khi click
-    # → thời gian đúng, không bị lệch múi giờ. Xem get_row_data() + caller.
-    # scrape_modal KHÔNG lấy apply_date nữa; caller sẽ ghi đè sau khi return.
     data["apply_date"] = ""
 
-    # ── 年齢・生年月日・性別 ───────────────────────────────────────────────
-    # <span data-type="human"></span>
-    # <span class="styles_infoText__UN0fw">43歳（1982年8月19日生まれ）／男性</span>
-    # E = 生年月日 YYYY/MM/DD,  F = 年齢 (数字のみ),  D = 性別
+    # ── 年齢・生年月日・性別・Email・Tel・住所 (dùng data-type, bền hơn class hash) ──
+    # [FIX-13] _get_icon_text đã sửa để bắt được layout mới (div bọc + hash đổi)
     bio_text = await _get_icon_text(modal, "human")
-    data["gender"]   = parse_gender(bio_text)
-    data["birthday"] = parse_birthday(bio_text)
-    data["age"]      = parse_age(bio_text)
+    if not bio_text and modal is not page:
+        bio_text = await _get_icon_text(page, "human")
+    data["gender"]   = parse_gender(bio_text)    # D ← 男性
+    data["birthday"] = parse_birthday(bio_text)  # E ← 1963/02/17
+    data["age"]      = parse_age(bio_text)        # F ← 63
 
-    # ── Email ─────────────────────────────────────────────────────────────
-    # <span data-type="mail"></span>
-    # <span class="styles_infoText__UN0fw">xxx@gmail.com</span>
-    data["email"] = await _get_icon_text(modal, "mail")
-
-    # ── 電話番号 ──────────────────────────────────────────────────────────
-    # <span data-type="call"></span>
-    # <span class="styles_infoText__UN0fw">08056915963</span>
-    data["tel"] = await _get_icon_text(modal, "call")
-
-    # ── 住所 ─────────────────────────────────────────────────────────────
-    # <span data-type="address"></span>
-    # <span class="styles_infoText__UN0fw">宮城県 東松島市...</span>
-    # ⚠️ Chỉ lấy từ icon address — không fallback heuristic để tránh ghi nhầm số điện thoại
-    data["address"] = await _get_icon_text(modal, "address")
+    data["email"]   = await _get_icon_text(modal, "mail") or await _get_icon_text(page, "mail")        # G
+    data["tel"]     = await _get_icon_text(modal, "call") or await _get_icon_text(page, "call")        # H
+    data["address"] = await _get_icon_text(modal, "address") or await _get_icon_text(page, "address")  # I
 
     # ── 応募求人名 ────────────────────────────────────────────────────────
-    # <a class="styles_jobTitleLink__YzGop ...">フィットネスジムの受付・ご案内スタッフ</a>
     data["job_name"] = ""
     for sel in [
         'a.styles_jobTitleLink__YzGop',
@@ -646,13 +706,11 @@ async def scrape_modal(page, apply_id: str) -> dict:
     ]:
         val = await mtext(sel)
         if val:
-            # Strip prefix kiểu [11263686] mà AirWork đôi khi thêm vào
             val = re.sub(r"^\[\d+\]\s*", "", val).strip()
             data["job_name"] = val
             break
 
-    # ── 雇用形態 (col K) ──────────────────────────────────────────────────
-    # <span class="styles_jobLabel__6SC9n">アルバイト・パート</span>
+    # ── 雇用形態 ──────────────────────────────────────────────────────────
     data["employment"] = ""
     for sel in [
         'span.styles_jobLabel__6SC9n',
@@ -664,8 +722,7 @@ async def scrape_modal(page, apply_id: str) -> dict:
             data["employment"] = val.strip()
             break
 
-    # ── 応募先 (col L) ────────────────────────────────────────────────────
-    # <span class="styles_jobCaption__hJsiu">アッティーボジム高見プラザ店</span>
+    # ── 応募先 ────────────────────────────────────────────────────────────
     data["work_location"] = ""
     for sel in [
         'span.styles_jobCaption__hJsiu',
@@ -774,7 +831,7 @@ async def iter_new_applicants(page, page_num: int, existing_ids: set, full_scan:
     for i, rd in enumerate(row_data):
         apply_id   = rd["apply_id"]
         apply_date = rd["apply_date"]
-        if apply_id in existing_ids:
+        if _norm_id(apply_id) in existing_ids:   # [FIX-14] so trùng đã chuẩn hoá
             log.info(f"    [{i+1}] ID={apply_id} đã có — bỏ qua")
             continue
 
@@ -835,6 +892,7 @@ async def process_account(browser, account: dict, sheets_service, full_scan: boo
         # Dò từng trang cho đến khi gặp apply_id đã có trong sheet → dừng.
         # Nếu full_scan → dò hết tất cả trang, bỏ qua ID đã có.
         all_new: list[dict] = []
+        run_seen: set = set()   # [FIX-14] chống trùng trong CÙNG 1 lần chạy
         page_num   = 1
         stop_scan  = False
 
@@ -856,7 +914,9 @@ async def process_account(browser, account: dict, sheets_service, full_scan: boo
             for i, rd in enumerate(row_data):
                 apply_id   = rd["apply_id"]
                 apply_date = rd["apply_date"]
-                if apply_id in existing_ids:
+                nid        = _norm_id(apply_id)   # [FIX-14] chuẩn hoá để so trùng
+
+                if nid in existing_ids:
                     if full_scan:
                         log.info(f"    [{i+1}] ID={apply_id} đã có — bỏ qua (full scan)")
                         continue
@@ -865,6 +925,12 @@ async def process_account(browser, account: dict, sheets_service, full_scan: boo
                         log.info(f"    [{i+1}] Gặp ID đã có ({apply_id}) — dừng quét")
                         stop_scan = True
                         break
+
+                # [FIX-14] Chống trùng trong cùng 1 lần chạy (ID xuất hiện 2 trang
+                # do danh sách dịch chuyển khi có entry mới giữa chừng)
+                if nid in run_seen:
+                    log.info(f"    [{i+1}] ID={apply_id} đã xử lý trong lần chạy này — bỏ qua")
+                    continue
 
                 detail = await click_and_scrape(page, apply_id, i + 1)
                 if detail is None:
@@ -875,6 +941,7 @@ async def process_account(browser, account: dict, sheets_service, full_scan: boo
                 if apply_date:
                     detail["apply_date"] = apply_date
 
+                run_seen.add(nid)   # [FIX-14] đánh dấu đã xử lý trong lần chạy này
                 log.info(f"    [{i+1}] ✓ {detail['name']}  {detail.get('apply_date', '')}")
                 all_new.append(detail)
 
@@ -911,7 +978,7 @@ async def process_account(browser, account: dict, sheets_service, full_scan: boo
             try:
                 total_written = append_batch(sheets_service, sheet_id, tab_name, all_new)
                 for a in all_new:
-                    existing_ids.add(a["apply_id"])
+                    existing_ids.add(_norm_id(a["apply_id"]))   # [FIX-14] chuẩn hoá
                     log.info(f"    ✅ {a['name']}  {a.get('apply_date', '')}")
             except Exception as e:
                 log.error(f"    ❌ Ghi batch thất bại: {e}")
