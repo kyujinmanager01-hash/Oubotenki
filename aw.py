@@ -56,6 +56,19 @@ FIX LOG:
                lượt vẫn placeholder → trả {} để click_and_scrape() click lại
              - download_resume: chờ link <a download> xuất hiện (tối đa ~12s)
                trước khi kết luận không có CV
+  [FIX-18] Trùng "thỉnh thoảng" (ghi lại ứng viên đã có): dedup chỉ dựa vào 1
+           lần đọc cột N; nếu lần đọc đó lỗi (rate-limit/timeout/mạng) thì trả
+           set RỖNG → tưởng Sheet trống → ghi lại tất cả. Bằng chứng: các bản
+           sao có 対応ステータス khác nhau (chộp ở các lần chạy khác nhau). Sửa
+           bằng 3 lớp:
+             1) get_existing_ids: retry + trả None khi thất bại → process_account
+                BỎ QUA công ty đó lần này, KHÔNG ghi gì (không bao giờ ghi khi
+                chưa chắc đọc được danh sách cũ).
+             2) Chốt chặn cuối: đọc lại cột N ngay trước khi ghi, lọc bỏ ID đã
+                tồn tại; đọc lại lỗi → hủy ghi lần này.
+             3) Lock file rpa.lock: chặn 2 lần chạy chồng nhau (Task Scheduler
+                30' nhưng 1 lần chạy có thể >30' do tải/upload CV) — 2 tiến
+                trình cùng đọc 1 trạng thái rồi cùng ghi cũng gây trùng.
 """
 
 import asyncio
@@ -63,6 +76,7 @@ import logging
 import os
 import re
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urljoin
@@ -102,6 +116,14 @@ ENTRIES_URL = "https://ats.rct.airwork.net/entries"
 
 ROW_SEL   = 'tr[data-la="entries_detail_transition_click"]'
 MODAL_SEL = 'div.styles_container__BMWEr[role="dialog"]'
+
+# ── [FIX-18] Lock chống 2 lần chạy chồng nhau ─────────────────────────────────
+# Task Scheduler 30 phút/lần; từ khi thêm tải+upload CV (FIX-15) mỗi lần chạy
+# lâu hơn — nếu lần trước chưa xong mà lần sau đã khởi động → 2 tiến trình cùng
+# đọc 1 trạng thái Sheet rồi cùng ghi → TRÙNG (đúng kiểu "thỉnh thoảng",
+# các bản sao có 対応ステータス khác nhau vì chạy ở thời điểm khác nhau).
+LOCK_FILE          = BASE_DIR / "rpa.lock"
+LOCK_STALE_SECONDS = 2 * 60 * 60   # >2h coi như lock cũ (tiến trình trước đã chết)
 
 # ── Retry config ──────────────────────────────────────────────────────────────
 MAX_MODAL_RETRIES   = 3   # số lần thử lại khi modal không lấy được tên
@@ -183,6 +205,40 @@ def _norm_id(v) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# [FIX-18] Lock chống chạy chồng
+# ══════════════════════════════════════════════════════════════════════════════
+
+def acquire_lock() -> bool:
+    """Trả True nếu giành được lock (được phép chạy). False nếu đang có lần
+    chạy khác còn hoạt động → nên thoát để tránh ghi trùng."""
+    try:
+        if LOCK_FILE.exists():
+            age = time.time() - LOCK_FILE.stat().st_mtime
+            if age < LOCK_STALE_SECONDS:
+                try:
+                    info = LOCK_FILE.read_text(encoding="utf-8").strip()
+                except Exception:
+                    info = "?"
+                log.warning(f"⛔ Đang có lần chạy khác ({info}), {age:.0f}s trước — THOÁT để tránh trùng.")
+                return False
+            log.warning(f"⚠️  Lock cũ {age:.0f}s (>{LOCK_STALE_SECONDS}s) — coi như tiến trình trước đã chết, ghi đè.")
+        LOCK_FILE.write_text(f"pid={os.getpid()} start={datetime.now():%Y-%m-%d %H:%M:%S}", encoding="utf-8")
+        return True
+    except Exception as e:
+        # Lỗi tạo lock không nên chặn chạy → chỉ cảnh báo
+        log.warning(f"⚠️  Không thao tác được lock ({e}) — vẫn chạy nhưng không có bảo vệ chống chồng.")
+        return True
+
+
+def release_lock():
+    try:
+        if LOCK_FILE.exists():
+            LOCK_FILE.unlink()
+    except Exception:
+        pass
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Google Sheets
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -249,28 +305,41 @@ def read_master_accounts(service) -> list[dict]:
     return accounts
 
 
-def get_existing_ids(service, sheet_id: str, tab: str) -> set:
+def get_existing_ids(service, sheet_id: str, tab: str, retries: int = 3):
     """
     [FIX-2]  Dùng apply_id (cột N = hidden key) làm dedup key thay vì name+date.
     [FIX-14] Đọc UNFORMATTED_VALUE + chuẩn hoá _norm_id để tránh ghi trùng
              do Sheet format số có dấu phẩy (29,760,116 ≠ 29760116).
+    [FIX-18] KHÔNG "thất bại trong im lặng" nữa. Trước đây nếu lần đọc này lỗi
+             (rate-limit / timeout / mạng) thì trả về set RỖNG → code tưởng
+             Sheet trống → ghi lại TẤT CẢ → trùng. Sửa:
+               - Thử lại tối đa `retries` lần (backoff tăng dần)
+               - Đọc THÀNH CÔNG (kể cả Sheet trống) → trả về set (có thể rỗng)
+               - Thất bại hết các lần → trả về None (KHÁC set rỗng) để caller
+                 biết "không chắc chắn" và BỎ QUA, không ghi gì.
     """
-    existing = set()
-    try:
-        result = service.spreadsheets().values().get(
-            spreadsheetId=sheet_id,
-            range=f"{tab}!N3:N",
-            valueRenderOption="UNFORMATTED_VALUE",  # [FIX-14] không lấy số đã format
-        ).execute()
-        for row in result.get("values", []):
-            if not row:
-                continue
-            nid = _norm_id(row[0])
-            if nid:
-                existing.add(nid)
-    except Exception as e:
-        log.warning(f"  ⚠️  Không đọc được cột ID Sheet: {e}")
-    return existing
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            result = service.spreadsheets().values().get(
+                spreadsheetId=sheet_id,
+                range=f"{tab}!N3:N",
+                valueRenderOption="UNFORMATTED_VALUE",  # [FIX-14] không lấy số đã format
+            ).execute()
+            existing = set()
+            for row in result.get("values", []):
+                if not row:
+                    continue
+                nid = _norm_id(row[0])
+                if nid:
+                    existing.add(nid)
+            return existing   # đọc thành công (rỗng cũng là hợp lệ)
+        except Exception as e:
+            last_err = e
+            log.warning(f"  ⚠️  Đọc cột ID Sheet lỗi (lần {attempt}/{retries}): {e}")
+            time.sleep(2 * attempt)   # backoff 2s, 4s, 6s...
+    log.error(f"  ❌ KHÔNG đọc được cột ID Sheet sau {retries} lần: {last_err}")
+    return None   # [FIX-18] tín hiệu "không chắc chắn" → caller phải bỏ qua
 
 
 def get_next_empty_row(service, sheet_id: str, tab: str) -> int:
@@ -1125,6 +1194,12 @@ async def process_account(browser, account: dict, sheets_service, drive_service,
     sheet_id        = extract_sheet_id(sheet_url)
     drive_folder_id = extract_drive_folder_id(account.get("drive_folder", ""))   # [FIX-15]
     existing_ids    = get_existing_ids(sheets_service, sheet_id, tab_name)
+    if existing_ids is None:
+        # [FIX-18] Không đọc chắc chắn được danh sách ID cũ → BỎ QUA công ty này
+        # lần chạy này, KHÔNG ghi gì (thà sót tạm 1 lần còn hơn ghi trùng).
+        log.error(f"  ⛔ Bỏ qua [{company}] lần này — không đọc được cột N (danh sách cũ). "
+                  f"KHÔNG ghi để tránh trùng. Lần chạy sau sẽ bù.")
+        return
     log.info(f"  📊 Sheet đã có {len(existing_ids)} ứng viên (theo apply_id)")
     if drive_folder_id:
         log.info(f"  📁 Folder Drive CV: {drive_folder_id}")
@@ -1239,6 +1314,34 @@ async def process_account(browser, account: dict, sheets_service, drive_service,
         all_new.sort(key=_sort_key)
         log.info(f"  🆕 {len(all_new)} ứng viên mới — ghi theo thứ tự cũ → mới")
 
+        # ── [FIX-18] CHỐT CHẶN CUỐI: đọc lại cột N ngay sát thời điểm ghi ─
+        # Loại mọi apply_id đã tồn tại trong Sheet (kể cả mới ghi bởi lần chạy
+        # khác, hoặc do lần đọc đầu bị thiếu sót). Nếu lần đọc lại này THẤT BẠI
+        # → KHÔNG ghi gì (an toàn), để lần sau bù.
+        if all_new:
+            fresh_existing = get_existing_ids(sheets_service, sheet_id, tab_name)
+            if fresh_existing is None:
+                log.error("  ⛔ Chốt chặn cuối: không đọc lại được cột N → HỦY ghi lần này để tránh trùng.")
+                # dọn file CV tạm đã tải (chưa upload) để khỏi phình ổ đĩa
+                for a in all_new:
+                    lp = a.get("resume_local", "")
+                    if lp and os.path.exists(lp):
+                        try:
+                            os.remove(lp)
+                        except Exception:
+                            pass
+                all_new = []
+            else:
+                before = len(all_new)
+                all_new = [
+                    a for a in all_new
+                    if _norm_id(a["apply_id"]) not in fresh_existing
+                    and _norm_id(a["apply_id"]) not in existing_ids
+                ]
+                removed = before - len(all_new)
+                if removed:
+                    log.warning(f"  🛡️  Chốt chặn cuối loại {removed} ứng viên ĐÃ CÓ trong Sheet (chống trùng)")
+
         # ── [FIX-15] Upload CV lên Drive + gắn link vào cột O ────────────
         if drive_folder_id and all_new:
             n_up = 0
@@ -1284,24 +1387,31 @@ async def main(headless: bool = True, full_scan: bool = False):
     log.info(f"# Mode: {'headless' if headless else 'visible'} | {'【全件スキャン】' if full_scan else '【新着チェック】'}")
     log.info(f"{'#'*60}")
 
-    sheets_service = get_sheets_service()
-    drive_service  = get_drive_service()   # [FIX-15]
-
-    log.info(f"\n📋 Đọc danh sách AW từ Sheet マスター管理...")
-    accounts = read_master_accounts(sheets_service)
-    log.info(f"✅ Tìm thấy {len(accounts)} tài khoản AW")
-
-    if not accounts:
-        log.warning("Không có tài khoản AW nào!")
+    # [FIX-18] Chống 2 lần chạy chồng nhau (nguyên nhân trùng "thỉnh thoảng")
+    if not acquire_lock():
         return
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=headless)
-        for account in accounts:
-            await process_account(browser, account, sheets_service, drive_service, full_scan)
-        await browser.close()
+    try:
+        sheets_service = get_sheets_service()
+        drive_service  = get_drive_service()   # [FIX-15]
 
-    log.info("\n✅ Hoàn thành tất cả!")
+        log.info(f"\n📋 Đọc danh sách AW từ Sheet マスター管理...")
+        accounts = read_master_accounts(sheets_service)
+        log.info(f"✅ Tìm thấy {len(accounts)} tài khoản AW")
+
+        if not accounts:
+            log.warning("Không có tài khoản AW nào!")
+            return
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=headless)
+            for account in accounts:
+                await process_account(browser, account, sheets_service, drive_service, full_scan)
+            await browser.close()
+
+        log.info("\n✅ Hoàn thành tất cả!")
+    finally:
+        release_lock()   # [FIX-18] luôn nhả lock kể cả khi lỗi
 
 
 if __name__ == "__main__":
