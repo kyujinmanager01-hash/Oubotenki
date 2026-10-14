@@ -44,6 +44,13 @@ def log(msg):
     print(f"[vpngate] {msg}", flush=True)
 
 
+def sh_bg(cmd):
+    """Chạy lệnh tự chạy nền (daemon): KHÔNG giữ ống output, nếu không sẽ bị treo."""
+    return subprocess.run(cmd, shell=True, check=False, timeout=30,
+                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL)
+
+
 def sh(cmd, check=True, **kw):
     return subprocess.run(cmd, shell=isinstance(cmd, str), check=check,
                           capture_output=True, text=True, **kw)
@@ -125,7 +132,7 @@ def start_openvpn(cfg):
     with open(OVPN_PATH, "w") as f:
         f.write(build_config(cfg))
     open(OVPN_LOG, "w").close()
-    sh(f"sudo openvpn --config {OVPN_PATH} --daemon --log {OVPN_LOG}", check=False)
+    sh_bg(f"sudo openvpn --config {OVPN_PATH} --daemon --log {OVPN_LOG}")
     deadline = time.time() + CONNECT_TIMEOUT
     while time.time() < deadline:
         try:
@@ -148,7 +155,7 @@ def start_proxy(ip):
             "ConnectPort 443\nConnectPort 80\nDisableViaHeader Yes\n"
             "LogFile \"/tmp/tinyproxy.log\"\nPidFile \"/tmp/tinyproxy.pid\"\n"
         )
-    sh(f"tinyproxy -c {TINY_CONF}")
+    sh_bg(f"tinyproxy -c {TINY_CONF}")
     time.sleep(1)
 
 
