@@ -129,29 +129,33 @@ def tun_ip():
 
 
 def start_openvpn(cfg):
+    """Chạy OpenVPN ở foreground (Popen), ghi toàn bộ output vào OVPN_LOG."""
     with open(OVPN_PATH, "w") as f:
         f.write(build_config(cfg))
-    open(OVPN_LOG, "w").close()
-    sh_bg(f"sudo openvpn --config {OVPN_PATH} --daemon --log {OVPN_LOG}")
+    logf = open(OVPN_LOG, "w")
+    proc = subprocess.Popen(
+        ["sudo", "openvpn", "--config", OVPN_PATH],
+        stdin=subprocess.DEVNULL, stdout=logf, stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
     deadline = time.time() + CONNECT_TIMEOUT
-    started = time.time()
+    ok = False
     while time.time() < deadline:
-        try:
-            text = open(OVPN_LOG).read()
-        except FileNotFoundError:
-            text = ""
-        if "Initialization Sequence Completed" in text:
-            return tun_ip()
-        # OpenVPN đã thoát (cấu hình lỗi / bị từ chối) => bỏ qua sớm
-        if time.time() - started > 5 and sh("pgrep -x openvpn", check=False).returncode != 0:
+        if "Initialization Sequence Completed" in open(OVPN_LOG).read():
+            ok = True
+            break
+        if proc.poll() is not None:  # OpenVPN đã thoát => lỗi
             break
         time.sleep(1)
-    try:
-        tail = [l for l in open(OVPN_LOG).read().splitlines() if l.strip()][-6:]
-        for l in tail:
-            log(f"    openvpn: {l}")
-    except FileNotFoundError:
-        pass
+    if ok:
+        return tun_ip()
+    code = proc.poll()
+    log(f"    openvpn exit code: {code if code is not None else 'còn chạy (hết thời gian chờ)'}")
+    lines = [l for l in open(OVPN_LOG).read().splitlines() if l.strip()]
+    for l in lines[-8:]:
+        log(f"    openvpn: {l}")
+    if not lines:
+        log("    openvpn: (log trống)")
     return None
 
 
@@ -194,6 +198,9 @@ def verify():
 
 
 def main():
+    log("phiên bản script: v3")
+    log("openvpn: " + (sh("openvpn --version | head -1", check=False).stdout.strip() or "KHÔNG TÌM THẤY"))
+    log("/dev/net/tun: " + ("có" if os.path.exists("/dev/net/tun") else "KHÔNG CÓ"))
     servers = fetch_servers()
     log(f"Có {len(servers)} server Nhật, thử tối đa {MAX_SERVERS}")
     for host, ip, score, cfg in servers[:MAX_SERVERS]:
