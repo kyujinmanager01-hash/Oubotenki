@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
 jobs:
   chay-script:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Lay code tu repo
         uses: actions/checkout@v4.2.2
@@ -21,7 +21,17 @@ jobs:
         run: |
           mkdir -p credentials
           echo '${{ secrets.GOOGLE_CREDENTIALS_JSON }}' > credentials/credentials.json
+      - name: Cai OpenVPN va tinyproxy
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openvpn tinyproxy
+          sudo systemctl stop tinyproxy || true
+      - name: Ket noi VPN Gate (Nhat Ban)
+        run: python vpngate_connect.py
       - name: Chay aw.py
         run: python aw.py
       - name: Chay kbx.py
         run: python kbx.py
+      - name: Ngat VPN
+        if: always()
+        run: sudo pkill -x openvpn || true
