@@ -86,6 +86,19 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload  # [FIX-15] upload CV lên Drive
 
+def get_proxy():
+    """Proxy Nhật (tuỳ chọn) qua biến môi trường PROXY_SERVER/PROXY_USER/PROXY_PASS."""
+    import os
+    server = os.getenv("PROXY_SERVER")
+    if not server:
+        return None
+    proxy = {"server": server}
+    if os.getenv("PROXY_USER"):
+        proxy["username"] = os.environ["PROXY_USER"]
+        proxy["password"] = os.getenv("PROXY_PASS", "")
+    return proxy
+
+
 # ── Paths ─────────────────────────────────────────────────────────────────────
 BASE_DIR   = Path(__file__).parent
 CRED_FILE  = BASE_DIR / "credentials" / "credentials.json"
@@ -1404,7 +1417,7 @@ async def main(headless: bool = True, full_scan: bool = False):
             return
 
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=headless)
+            browser = await p.chromium.launch(headless=headless, proxy=get_proxy())
             for account in accounts:
                 await process_account(browser, account, sheets_service, drive_service, full_scan)
             await browser.close()
