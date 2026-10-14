@@ -134,13 +134,24 @@ def start_openvpn(cfg):
     open(OVPN_LOG, "w").close()
     sh_bg(f"sudo openvpn --config {OVPN_PATH} --daemon --log {OVPN_LOG}")
     deadline = time.time() + CONNECT_TIMEOUT
+    started = time.time()
     while time.time() < deadline:
         try:
-            if "Initialization Sequence Completed" in open(OVPN_LOG).read():
-                return tun_ip()
+            text = open(OVPN_LOG).read()
         except FileNotFoundError:
-            pass
+            text = ""
+        if "Initialization Sequence Completed" in text:
+            return tun_ip()
+        # OpenVPN đã thoát (cấu hình lỗi / bị từ chối) => bỏ qua sớm
+        if time.time() - started > 5 and sh("pgrep -x openvpn", check=False).returncode != 0:
+            break
         time.sleep(1)
+    try:
+        tail = [l for l in open(OVPN_LOG).read().splitlines() if l.strip()][-6:]
+        for l in tail:
+            log(f"    openvpn: {l}")
+    except FileNotFoundError:
+        pass
     return None
 
 
