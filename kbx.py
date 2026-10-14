@@ -117,6 +117,19 @@ from playwright.async_api import async_playwright, TimeoutError as PlaywrightTim
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
+def get_proxy():
+    """Proxy Nhật (tuỳ chọn) qua biến môi trường PROXY_SERVER/PROXY_USER/PROXY_PASS."""
+    import os
+    server = os.getenv("PROXY_SERVER")
+    if not server:
+        return None
+    proxy = {"server": server}
+    if os.getenv("PROXY_USER"):
+        proxy["username"] = os.environ["PROXY_USER"]
+        proxy["password"] = os.getenv("PROXY_PASS", "")
+    return proxy
+
+
 # ── Paths ─────────────────────────────────────────────────────────────────────
 BASE_DIR   = Path(__file__).parent
 CRED_FILE  = BASE_DIR / "credentials" / "credentials.json"
@@ -1177,7 +1190,7 @@ async def manual_login_one(account: dict) -> bool:
     print(f"{'='*60}")
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=False)
+        browser = await p.chromium.launch(headless=False, proxy=get_proxy())
         context = await browser.new_context(**new_context_kwargs())
         await context.add_init_script(_STEALTH_INIT_SCRIPT)
         page = await context.new_page()
@@ -1278,7 +1291,7 @@ async def main(headless: bool = True, full_scan: bool = False):
         return
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=headless)
+        browser = await p.chromium.launch(headless=headless, proxy=get_proxy())
         for account in accounts:
             await process_account_kbx(browser, account, sheets_service, full_scan)
         await browser.close()
